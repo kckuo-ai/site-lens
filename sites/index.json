@@ -1,0 +1,16 @@
+[
+  {
+    "id": "anchorage",
+    "name": "Anchorage",
+    "nameEn": "Anchorage",
+    "band": "n48",
+    "hasV2": true
+  },
+  {
+    "id": "kaohsiung",
+    "name": "高雄",
+    "nameEn": "Kaohsiung",
+    "band": "n79",
+    "approx": true
+  }
+]

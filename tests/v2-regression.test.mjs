@@ -7,16 +7,10 @@ import { createRT } from '../js/rt.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// Extract Anchorage site definition (BS, V2 drive test) directly from index.html so the test stays in sync
 function loadAnchorageV2() {
-  const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
-  const bsM = html.match(/anchorage:\s*\{[\s\S]*?bs:\s*\{\s*lat:\s*([\d.-]+),\s*lon:\s*([\d.-]+)\s*\}/);
-  const v2M = html.match(/v2:\s*\{\s*tower:\s*\[[^\]]+\],\s*utc:\s*"[^"]+",\s*rows:\s*(\[\[[\s\S]*?\]\])\s*\}/);
-  assert.ok(bsM && v2M, 'failed to extract Anchorage BS and V2 rows from index.html');
-  return {
-    bs: { lat: parseFloat(bsM[1]), lon: parseFloat(bsM[2]) },
-    rows: JSON.parse(v2M[1]),
-  };
+  const site = JSON.parse(fs.readFileSync(path.join(ROOT, 'sites/anchorage/site.json'), 'utf8'));
+  const v2 = JSON.parse(fs.readFileSync(path.join(ROOT, site.v2File), 'utf8'));
+  return { bs: site.bs, rows: v2.rows };
 }
 
 const B_RES = new Set(['house', 'detached', 'residential', 'bungalow', 'cabin', 'semidetached_house', 'terrace', 'shed', 'garage', 'garages', 'carport', 'static_caravan']);

@@ -327,6 +327,30 @@ tr.p:hover,tr.p.on{background:rgba(255,179,71,.12)}
       <p class="secsum" id="secSiteSum"></p>
 
       <label class="f">評估站點<select id="siteSel"></select></label>
+      <div class="tools" style="margin-top:6px">
+        <button type="button" id="projNew">＋ 新增專案</button>
+        <button type="button" id="projExp">匯出專案</button>
+        <button type="button" id="projImpBtn">匯入專案</button>
+        <input type="file" id="projImp" accept=".json,.sitelens.json" hidden>
+        <button type="button" id="projDel" hidden>刪除專案</button>
+      </div>
+      <div id="projForm" hidden style="margin-top:8px;padding:8px;border:1px solid var(--bd);border-radius:8px;background:rgba(255,255,255,.02)">
+        <p class="sub" style="margin:0 0 6px">新建本機專案（僅存在這個瀏覽器，不公開上傳，適合客戶保密案場）。</p>
+        <label class="f">專案名稱<input type="text" id="npName" placeholder="例如：台北測試場域"></label>
+        <div class="row2" style="margin-top:6px">
+          <label class="f">中心緯度<input type="number" id="npLat" step="0.000001" inputmode="decimal" placeholder="25.033964"></label>
+          <label class="f">中心經度<input type="number" id="npLon" step="0.000001" inputmode="decimal" placeholder="121.564468"></label>
+        </div>
+        <div class="row2" style="margin-top:6px">
+          <label class="f">地區<select id="npRegion"><option value="tw">臺灣（NLSC 3D／正射）</option><option value="us">美國（木造為主）</option><option value="other">其他地區（OSM）</option></select></label>
+          <label class="f">頻段<select id="npBand"><option value="n79">n79（4850 MHz）</option><option value="n78">n78（3500 MHz）</option><option value="n77">n77（3750 MHz）</option><option value="n48">n48 CBRS（3625 MHz）</option></select></label>
+        </div>
+        <label class="f" style="margin-top:6px">評估半徑 (m)<input type="number" id="npRad" value="500" min="100" max="1500" step="50"></label>
+        <div class="tools" style="margin-top:8px">
+          <button type="button" class="primary" id="npCreate">建立並切換</button>
+          <button type="button" id="npCancel">取消</button>
+        </div>
+      </div>
       <div class="row2" style="margin-top:8px">
         <label class="f">基站緯度<input type="number" id="bsLat" step="0.000001" inputmode="decimal"></label>
         <label class="f">基站經度<input type="number" id="bsLon" step="0.000001" inputmode="decimal"></label>
@@ -677,53 +701,25 @@ tr.p:hover,tr.p.on{background:rgba(255,179,71,.12)}
 
 <script type="module">
 import { RT } from './js/rt.js';
+import { idbGetWithMigration, idbSet, idbDel, sanitizeMap } from './js/storage.js';
+import { loadSiteCatalog, loadSiteDefinition, createCustomSiteSpec, saveCustomSite, deleteCustomSite, buildProjectBundle, importProjectBundle } from './js/site-manager.js';
 window.RT = RT;
 const escHtml = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-/* ===== Sites ===== */
-// Each site: BS (approximate is fine), evaluation UEs, area for live OSM queries, optional bundled buildings and drive test.
-const ringUEs = (lat, lon, offs) => offs.map(([e, n]) => ({ lat: +(lat + n / 111320).toFixed(7), lon: +(lon + e / (111320 * Math.cos(lat * Math.PI / 180))).toFixed(7) }));
-const SITES = {
-  anchorage: {
-    name: 'Anchorage', store: 'alaska', band: 'n48',
-    bs: { lat: 61.1729384, lon: -149.8841974 },
-    ues: [
-      [61.1735872, -149.8857155], [61.1721515, -149.8827259], [61.1754019, -149.8838769], [61.1746329, -149.8828644],
-      [61.1736982, -149.8812983], [61.1726030, -149.8789537], [61.1758706, -149.8926454], [61.1724572, -149.8923047]
-    ].map(([lat, lon]) => ({ lat, lon })),
-    v2scen: 'car', matProfile: 'us',
-    defaults: { ruP: 31, ssPwr: 0, defH: 6 },   // lidar median 5.9 m for buildings the survey didn't measure
-    bsrc: ['osmb', 'kmz', 'osm'], files: { osmb: 'buildings_osm.json', kmz: 'buildings_kmz.json', lidar: 'lidar/heights_anchorage.json', canopy: 'lidar/canopy_anchorage.json' }, osmbDate: '2026-11-06',
-    v2: { tower: [61.1728742, -149.88421488], utc: "2026-11-04", rows: [[38,61.1720903,-149.8844744,-99,-11,17,15,0],[39,61.1709414,-149.8844269,-106,-11,9,15,0],[40,61.1706616,-149.8832569,-112,-11,11,15,0],[41,61.1699155,-149.8830957,-119,-12,2,15,0],[42,61.1691207,-149.8821148,-119,-12,5,15,0],[43,61.1680679,-149.8815798,-126,-14,5,15,0],[44,61.1672085,-149.8811563,-127,-15,0,15,0],[45,61.1667477,-149.8805588,null,null,null,null,0],[46,61.1665482,-149.8806022,null,null,null,null,0],[47,61.1665937,-149.8834488,null,null,null,null,0],[48,61.1674583,-149.886345,null,null,null,null,0],[49,61.1695553,-149.886265,-106,-11,5,15,0],[50,61.1725342,-149.8862741,-104,-17,-3,15,0],[51,61.173332,-149.8863359,-101,-11,14,14,0],[52,61.1736887,-149.888122,-96,-11,21,14,0],[53,61.1736797,-149.8959425,-124,-14,1,14,0],[54,61.1740745,-149.897883,-122,-13,3,14,0],[55,61.1776181,-149.8979025,-128,-15,-4,14,0],[56,61.1793577,-149.8978881,null,null,null,null,0],[57,61.1806851,-149.8954412,null,null,null,null,0],[58,61.1806626,-149.8904118,null,null,null,null,0],[59,61.1798431,-149.8865554,null,null,null,null,0],[60,61.1784078,-149.8865239,-129,-17,-6,14,0],[61,61.1764676,-149.8865006,-129,-18,-7,14,0],[62,61.17485,-149.8864259,-110,-11,12,14,0],[63,61.1739195,-149.8864099,-90,-11,22,14,0],[64,61.1735454,-149.8853869,-98,-11,19,14,2],[65,61.1735464,-149.8827531,-100,-11,23,13,0],[66,61.17355,-149.8800515,-106,-11,14,13,0],[67,61.1735427,-149.8757785,-125,-14,1,13,0],[68,61.1735337,-149.8707143,null,null,null,null,0],[69,61.1694855,-149.8682557,null,null,null,null,0],[70,61.1669182,-149.8682296,null,null,null,null,1],[71,61.1664797,-149.8685392,null,null,null,null,1],[72,61.166531,-149.8770578,null,null,null,null,1],[73,61.166504,-149.8798525,null,null,null,null,0],[74,61.1689889,-149.8819143,-121,-12,4,15,0],[75,61.1722469,-149.883019,-104,-13,2,15,0],[76,61.1730742,-149.8827681,null,null,null,null,0],[77,61.1730725,-149.8825892,-98,-11,20,13,0],[78,61.1730745,-149.8821971,-100,-11,9,13,0],[79,61.1730675,-149.8813284,-105,-11,14,13,0],[80,61.1730692,-149.8802258,-111,-11,10,13,0],[81,61.1730687,-149.8792339,-113,-11,9,13,0],[82,61.1734858,-149.8789338,-107,-11,16,13,0],[83,61.1741597,-149.8789363,-115,-12,5,13,0],[84,61.1753023,-149.878938,-120,-12,4,13,0],[85,61.1765661,-149.8789464,-121,-12,5,13,0],[86,61.1771691,-149.8789436,null,null,null,null,0],[87,61.1772325,-149.8830126,-124,-14,2,13,0],[88,61.1767915,-149.8831544,-123,-13,1,13,0],[89,61.175969,-149.8831334,-120,-13,5,13,0],[90,61.1747627,-149.8831234,-113,-12,4,13,0],[91,61.1739158,-149.8831078,-108,-11,7,13,0],[92,61.1736246,-149.8839572,-99,-11,12,13,0],[93,61.1732053,-149.8843833,-100,-13,4,14,0],[94,61.1728113,-149.8845061,-107,-16,0,14,0]] }
-  },
-  kaohsiung: {
-    name: '高雄', matProfile: 'tw', store: 'khh', band: 'n79', tw: true, approx: true,
-    bs: { lat: 22.7815028, lon: 120.4187782 },
-    area: { lat: 22.7815028, lon: 120.4187782, r: 700 },
-    // UEs inside the planned coverage polygon of the RU plan v2 (2026-11-09); UE 1 is the point Albert picked on site
-    ueKey: 'UEs_v2',
-    ues: [{ lat: 22.7816956, lon: 120.4188902 }, { lat: 22.7814, lon: 120.4177 }, { lat: 22.78178, lon: 120.41762 }, { lat: 22.782, lon: 120.4185 },
-      { lat: 22.78235, lon: 120.4192 }, { lat: 22.78268, lon: 120.4201 }, { lat: 22.78305, lon: 120.42047 }, { lat: 22.78362, lon: 120.41975 }],
-    bsrc: ['nlsc3d', 'osm'], nlscCode: 4, files: {},
-    // 高雄仁愛之家 RU 建議布點 v2 (KML, 2026-11-09): WNC R3210-079MT n79 100 MHz. Indoor RUs are map markers only for now.
-    // 2026-11-09: positions of C1-06/C1-07/C2-01/C2-02 corrected to the RU plan screenshot (the KML import had them on each other's spots); other RUs match it within ~3 m.
-    // azVer 2 (2026-11-09): azimuths read off the coverage sketch 「仁愛之家 涵蓋示意（扇形疊加）」, ±10°
-    rus: { src: '高雄仁愛之家 RU 建議布點 v2（WNC R3210-079MT，n79 100 MHz）', tilt: 6, azVer: 2, list: [{"id":"RU-C1-01-P","cell":1,"lat":22.78113168,"lon":120.4178977,"az":285.0,"indoor":false,"panel":true,"loc":"西南寢區南棟","mount":"屋頂走道（Panel 90° 朝東北）","use":"SW 群聚南段"},{"id":"RU-C1-02-P","cell":1,"lat":22.78157937,"lon":120.41746614,"az":20.0,"indoor":false,"panel":true,"loc":"西南寢區北棟","mount":"屋頂走道（Panel 90° 朝東）","use":"SW 群聚北段，銜接中央長廊"},{"id":"RU-C1-03-P","cell":1,"lat":22.78139927,"lon":120.41807939,"az":100.0,"indoor":false,"panel":true,"loc":"中央長廊西排南段","mount":"屋頂南角","use":"西排寢室南段"},{"id":"RU-C1-04-P","cell":1,"lat":22.78216089,"lon":120.41862259,"az":220.0,"indoor":false,"panel":true,"loc":"中央長廊西排北段","mount":"屋頂北角","use":"西排寢室北段"},{"id":"RU-C1-05-P","cell":1,"lat":22.78199875,"lon":120.41884472,"az":180.0,"indoor":false,"panel":true,"loc":"中央長廊東排南段","mount":"屋頂南角","use":"東排南段，對打中庭"},{"id":"RU-C1-06-P","cell":1,"lat":22.78304293,"lon":120.42080563,"az":265.0,"indoor":false,"panel":true,"loc":"中央長廊東排北段","mount":"屋頂北角","use":"東排北段"},{"id":"RU-C1-07-P","cell":1,"lat":22.78326705,"lon":120.42007053,"az":180.0,"indoor":false,"panel":true,"loc":"中央連接帶","mount":"長廊中段屋頂","use":"SW↔NE 連接帶弱波填補"},{"id":"RU-C1-08-P","cell":1,"lat":22.7828455,"lon":120.41960331,"az":190.0,"indoor":false,"panel":true,"loc":"東南 9 之 1 內緣","mount":"黃框東南內側棟屋頂","use":"東南內圈（黃框內）"},{"id":"RU-C2-01-P","cell":2,"lat":22.78392165,"lon":120.42020189,"az":245.0,"indoor":false,"panel":true,"loc":"大禮堂西棟","mount":"大禮堂群組西側屋頂","use":"Cell-2 西半"},{"id":"RU-C2-02-P","cell":2,"lat":22.78337909,"lon":120.41934161,"az":210.0,"indoor":false,"panel":true,"loc":"大禮堂東棟","mount":"大禮堂群組東側屋頂","use":"Cell-2 東半"},{"id":"RU-C3-01-Indoor","cell":3,"lat":22.78184225,"lon":120.41902111,"az":null,"indoor":true,"panel":false,"loc":"","mount":"","use":""},{"id":"RU-C3-02-Indoor-P","cell":3,"lat":22.78176537,"lon":120.41909387,"az":null,"indoor":true,"panel":true,"loc":"","mount":"","use":""},{"id":"RU-C3-03-Indoor","cell":3,"lat":22.78188814,"lon":120.41926864,"az":null,"indoor":true,"panel":false,"loc":"","mount":"","use":""},{"id":"RU-C3-04-Indoor","cell":3,"lat":22.78234882,"lon":120.41921824,"az":null,"indoor":true,"panel":false,"loc":"","mount":"","use":""},{"id":"RU-C3-05-Indoor-P","cell":3,"lat":22.78233052,"lon":120.41935883,"az":null,"indoor":true,"panel":true,"loc":"","mount":"","use":""}] },
-    cover: { name: '預計涵蓋範圍', poly: [[120.4200409,22.7833489],[120.4200724,22.7836346],[120.4201175,22.7839883],[120.4195417,22.7837799],[120.4191596,22.7835105],[120.4191778,22.7830691],[120.4190265,22.7829076],[120.41901,22.7826528],[120.4190361,22.7825522],[120.4191235,22.7825003],[120.4190776,22.7822388],[120.4186415,22.7822214],[120.4186053,22.7823514],[120.4183799,22.782263],[120.4183031,22.7820965],[120.4180832,22.7816937],[120.4179073,22.781897],[120.4175338,22.7820413],[120.4172852,22.7818968],[120.4170482,22.7815668],[120.4170835,22.781276],[120.4174534,22.7811495],[120.4178751,22.7811747],[120.4187181,22.7812587],[120.4188061,22.781016],[120.4189936,22.7810315],[120.4189731,22.7812915],[120.4190186,22.7816112],[120.4194066,22.7817651],[120.4195134,22.7821477],[120.4204752,22.7827756],[120.4207609,22.7826674],[120.4208906,22.7827801],[120.4208977,22.7828986],[120.4208271,22.7831972],[120.4207312,22.7834389],[120.4200409,22.7833489]] },
-    defaults: { fMHz: 4850, bw: 100, scs: 30, ruP: 35.2, ssPwr: 0, nPort: 4, antMode: 'multi', antModel: 'generic', antG: 10, hpbw: 90, vpbw: 30, fb: 25, slav: 20, mtilt: 0, cableL: 0.5, defH: 10, mast: 3, hR: 200, hStep: 10 }
-  }
-};
+/* ===== Sites (loaded from sites/index.json + local IndexedDB custom projects) ===== */
+const CATALOG = await loadSiteCatalog('.');
+const CATALOG_MAP = Object.fromEntries(CATALOG.all.map(x => [x.id, x]));
 const SITE_ID = (() => {
   let id = null;
   try { id = new URLSearchParams(location.search).get('site'); } catch (e) {}
   if (!id) try { id = localStorage.getItem('lastSite'); } catch (e) {}
-  return SITES[id] ? id : 'anchorage';
+  return CATALOG_MAP[id] ? id : (CATALOG.all[0] ? CATALOG.all[0].id : 'anchorage');
 })();
 try { localStorage.setItem('lastSite', SITE_ID); } catch (e) {}
-const SITE = SITES[SITE_ID];
+const { site: SITE } = await loadSiteDefinition(SITE_ID, '.');
 const APP_NAME = 'SiteLens';   // 站點覆蓋評估 / site coverage evaluation
+const EN_SITE = Object.fromEntries(CATALOG.all.filter(x => x.nameEn && x.nameEn !== x.name).map(x => [x.name, x.nameEn]));
 const appTitle = en => `${APP_NAME} · ${en && EN_SITE[SITE.name] ? EN_SITE[SITE.name] : SITE.name}`;
-const EN_SITE = { '高雄': 'Kaohsiung' };
 const SK = k => SITE.store + k;   // per-site storage keys; Anchorage keeps the original alaska* names
 const ORIG_BS = { ...SITE.bs };
 try { const b = JSON.parse(localStorage.getItem(SK('BS')) || 'null'); if (b && Number.isFinite(b.lat) && Number.isFinite(b.lon)) SITE.bs = b; } catch (e) {}
@@ -848,7 +844,7 @@ function syncNlscRow() {
   $('#nlscNote').textContent = '資料：內政部國土測繪中心三維建物模型（免申請 3D Tiles 服務）。第一次會下載該縣市的圖磚索引（約 50 MB）與場域周圍的建物圖磚，之後存在這個瀏覽器。' +
     (c && c.list ? `\n目前快取：${NLSC_C[c.code][0]} ${c.list.length} 棟，${c.date} 下載。` : '');
 }
-st.nlscCache = (() => { try { return JSON.parse(localStorage.getItem(SK('NLSC3D')) || 'null'); } catch (e) { return null; } })();
+st.nlscCache = await idbGetWithMigration(SK('NLSC3D'));
 const glbAcc = (js, bin, ai) => {
   const a = js.accessors[ai], v = js.bufferViews[a.bufferView], n = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 }[a.type];
   const T = { 5126: Float32Array, 5125: Uint32Array, 5123: Uint16Array, 5121: Uint8Array, 5122: Int16Array, 5120: Int8Array }[a.componentType];
@@ -960,7 +956,7 @@ async function loadNLSC3D(force) {
   if (!list.length) throw new Error(failed ? `三維建物圖磚下載失敗（${failed}/${pick.length} 塊失敗）` : '這個範圍內沒有三維建物');
   const d = new Date(), p2 = n => String(n).padStart(2, '0');
   st.nlscCache = { sig, code, date: `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`, list };
-  try { localStorage.setItem(SK('NLSC3D'), JSON.stringify(st.nlscCache)); } catch (e) { console.warn(e); }
+  await idbSet(SK('NLSC3D'), st.nlscCache);
   st.osmNote = `建築為內政部國土測繪中心三維建物（${NLSC_C[code][0]}，${list.length} 棟，含官方建物高度${failed ? `；另有 ${failed} 塊圖磚下載失敗` : ''}）。`;
   syncNlscRow();
   return { parsed: list };
@@ -982,8 +978,7 @@ async function fetchOSM() {
   const mlat = 150 / 111320, mlon = 150 / (111320 * Math.cos(SITE.bs.lat * Math.PI / 180));
   const bb = [Math.min(...pts.map(p => p.lat)) - mlat, Math.min(...pts.map(p => p.lon)) - mlon, Math.max(...pts.map(p => p.lat)) + mlat, Math.max(...pts.map(p => p.lon)) + mlon].map(v => v.toFixed(5)).join(',');
   const q = `[out:json][timeout:25];(way["building"](${bb});relation["building"](${bb}););out tags geom;`;
-  let cached = null;
-  try { cached = JSON.parse(localStorage.getItem(SK('OSM')) || 'null'); } catch (e) {}
+  const cached = await idbGetWithMigration(SK('OSM'));
   st.osmNote = '';
   if (cached && cached.q === q && Date.now() - cached.t < 7 * 864e5) return cached.data;
   const eps = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
@@ -996,7 +991,7 @@ async function fetchOSM() {
       if (!res.ok) throw new Error(new URL(ep).hostname + ' 回應 ' + res.status);
       const data = await res.json();
       if (!data.elements || !data.elements.length) throw new Error(new URL(ep).hostname + ' 回傳空資料');
-      try { localStorage.setItem(SK('OSM'), JSON.stringify({ q, t: Date.now(), data })); } catch (e) {}
+      await idbSet(SK('OSM'), { q, t: Date.now(), data });
       return data;
     } catch (e) { lastErr = e; } finally { clearTimeout(timer); }
   }
@@ -1026,8 +1021,8 @@ function parseOSM(json) {
 }
 
 /* ===== buildings traced from the NLSC EMAP basemap (light-purple building fill), kept per site in this browser ===== */
-st.traced = (() => { try { return JSON.parse(localStorage.getItem(SK('Traced')) || '[]') || []; } catch (e) { return []; } })();
-const saveTraced = () => { try { localStorage.setItem(SK('Traced'), JSON.stringify(st.traced)); } catch (e) { status('描出的建築太多，瀏覽器存不下；重新整理後需要再描一次。', true); } };
+st.traced = (await idbGetWithMigration(SK('Traced'))) || [];
+const saveTraced = () => { idbSet(SK('Traced'), st.traced).then(ok => { if (!ok) status('描出的建築太多，瀏覽器存不下；重新整理後需要再描一次。', true); }); };
 // buildings drawn by hand on the map (any site), kept per site in this browser; they go into the model like OSM ones
 st.drawn = (() => { try { return JSON.parse(localStorage.getItem(SK('Drawn')) || '[]') || []; } catch (e) { return []; } })();
 const saveDrawn = () => { try { localStorage.setItem(SK('Drawn'), JSON.stringify(st.drawn)); } catch (e) { status('新增的建築太多，瀏覽器存不下；請用「下載建築 JSON」備份。', true); } };
@@ -2487,11 +2482,12 @@ $('#tbl').addEventListener('click', e => {
 // per-port output power = EPRE + 10·log10(number of subcarriers in the carrier)
 // Wipe this site's per-browser edits (two presses, no modal dialog) and reload with the site defaults
 let siteResetArm = 0;
-$('#siteReset').addEventListener('click', () => {
+$('#siteReset').addEventListener('click', async () => {
   if (Date.now() - siteResetArm > 5000) { siteResetArm = Date.now(); $('#siteReset').textContent = '再按一次確認清除'; setTimeout(() => { if (Date.now() - siteResetArm >= 5000) $('#siteReset').textContent = '清除本機設定，回到預設'; }, 5100); return; }
   try {
     ['RUs', 'UEs', SITE.ueKey || 'UEs', 'BS', 'BH', 'BHseedFix', 'Mat', 'Cal', 'Extra', 'Traced', 'Drawn', 'H3D'].forEach(k => localStorage.removeItem(SK(k)));
     ['devLoss', 'planScen'].forEach(k => localStorage.removeItem(k));
+    await idbDel(SK('Traced'));
   } catch (e) {}
   hardReload();
 });
@@ -2550,10 +2546,11 @@ $('#upB').onchange = async e => {
     const dr = (j.buildings || []).filter(b => b.src === 'drawn' && Array.isArray(b.ll)), have = new Set(st.drawn.map(b => b.id));
     dr.forEach(b => { if (!have.has(b.id)) st.drawn.push(b); }); if (dr.length) saveDrawn();
     st.osm = withTraced(j.buildings || parseOSM(j));
-    const ov = j.height_overrides_m ? Object.keys(j.height_overrides_m).length : 0;
-    if (ov) { Object.assign(st.hOv, j.height_overrides_m); saveOv(); }
-    if (j.material_overrides) { Object.assign(st.matOv, j.material_overrides); saveMat(); }
-    if (j.heights_3d) { Object.assign(st.h3d, j.heights_3d); saveH3d(); }
+    const hMap = sanitizeMap(j.height_overrides_m, v => typeof v === 'number' && Number.isFinite(v) && v > 0);
+    const ov = Object.keys(hMap).length;
+    if (ov) { Object.assign(st.hOv, hMap); saveOv(); }
+    if (j.material_overrides) { Object.assign(st.matOv, sanitizeMap(j.material_overrides, v => ['wood', 'mixed', 'concrete', 'irr'].includes(v))); saveMat(); }
+    if (j.heights_3d) { Object.assign(st.h3d, sanitizeMap(j.heights_3d, v => Array.isArray(v) && v.length >= 1 && Number.isFinite(v[0]))); saveH3d(); }
     status(`已載入本機建築資料：${st.osm.length} 棟${dr.length ? `（含 ${dr.length} 棟你新增的）` : ''}${ov ? `，並還原 ${ov} 筆你設定的高度` : ''}。` + (st.viewer ? '' : '請按「載入地圖並計算」。'));
     if (st.viewer) refresh(true);
   }
@@ -2933,9 +2930,54 @@ async function moveBS(lat, lon) {
   status(`基站移到 ${lat.toFixed(6)}, ${lon.toFixed(6)}。` + (bsBuilding < 0 ? `這個位置不在任何建築內，天線底座沿用「BS 所在建築高度」${fmt(+$('#bsH').value || 0)} m，請到參數確認。` : `所在建築高 ${fmt(st.list[bsBuilding].h)} m。`) + (hadHeat ? '熱力圖已清除，請重新計算。' : ''));
 }
 (function initSite() {
-  $('#siteSel').innerHTML = Object.entries(SITES).map(([id, x]) => `<option value="${id}">${x.name}${x.v2 ? '（含路測）' : x.approx ? '（事前評估）' : ''}</option>`).join('');
+  $('#siteSel').innerHTML = CATALOG.all.map(x => `<option value="${escHtml(x.id)}">${escHtml(x.name)}${x.custom ? '（本機專案）' : x.hasV2 ? '（含路測）' : x.approx ? '（事前評估）' : ''}</option>`).join('');
   $('#siteSel').value = SITE_ID;
-  $('#siteSel').addEventListener('change', () => { try { localStorage.setItem('lastSite', $('#siteSel').value); } catch (e) {} location.search = '?site=' + $('#siteSel').value; });
+  $('#siteSel').addEventListener('change', () => { try { localStorage.setItem('lastSite', $('#siteSel').value); } catch (e) {} location.search = '?site=' + encodeURIComponent($('#siteSel').value); });
+  $('#projNew').onclick = () => {
+    const f = $('#projForm'); f.hidden = !f.hidden;
+    if (!f.hidden && !$('#npLat').value) { $('#npLat').value = SITE.bs.lat.toFixed(6); $('#npLon').value = SITE.bs.lon.toFixed(6); }
+  };
+  $('#npCancel').onclick = () => { $('#projForm').hidden = true; };
+  $('#npCreate').onclick = async () => {
+    const lat = +$('#npLat').value, lon = +$('#npLon').value;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) { status('請輸入合法的經緯度。', true); return; }
+    const { id, site } = createCustomSiteSpec({ name: $('#npName').value, lat, lon, region: $('#npRegion').value, band: $('#npBand').value, radius: +$('#npRad').value || 500 });
+    await saveCustomSite(id, site);
+    try { localStorage.setItem('lastSite', id); } catch (e) {}
+    location.search = '?site=' + encodeURIComponent(id);
+  };
+  $('#projExp').onclick = () => {
+    const getLS = k => { try { return JSON.parse(localStorage.getItem(SK(k)) || 'null'); } catch (e) { return null; } };
+    const bundle = buildProjectBundle({
+      siteId: SITE_ID,
+      site: { ...SITE, bs: ORIG_BS, ues: ORIG_UES },
+      overrides: { bs: SITE.bs, ues: SITE.ues, rus: getLS('RUs'), hOv: st.hOv, matOv: st.matOv, h3d: st.h3d, drawn: st.drawn, traced: st.traced, cal: getLS('Cal'), extra: getLS('Extra') },
+      appVersion: APP_VERSION,
+    });
+    download(`${SITE_ID}.sitelens.json`, bundle);
+    toast('已匯出專案檔（.sitelens.json）。');
+  };
+  $('#projImpBtn').onclick = () => $('#projImp').click();
+  $('#projImp').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    try {
+      const res = await importProjectBundle(JSON.parse(await f.text()));
+      try { localStorage.setItem('lastSite', res.siteId); } catch (err) {}
+      status(`已匯入專案「${res.name}」，正在切換…`);
+      location.search = '?site=' + encodeURIComponent(res.siteId);
+    } catch (err) { status('專案檔匯入失敗：' + (err && err.message || err), true); }
+    finally { e.target.value = ''; }
+  };
+  if (SITE.custom) {
+    $('#projDel').hidden = false;
+    let delArm = 0;
+    $('#projDel').onclick = async () => {
+      if (Date.now() - delArm > 5000) { delArm = Date.now(); $('#projDel').textContent = '再按一次確認刪除'; setTimeout(() => { if (Date.now() - delArm >= 5000) $('#projDel').textContent = '刪除專案'; }, 5100); return; }
+      await deleteCustomSite(SITE_ID);
+      try { localStorage.removeItem('lastSite'); } catch (e) {}
+      location.search = '';
+    };
+  }
   $('#band').innerHTML = Object.entries(BANDS).map(([id, b]) => `<option value="${id}">${b.lbl}</option>`).join('');
   $('#band').value = SITE.band || 'n48';
   const d = SITE.defaults || {};
@@ -3369,7 +3411,7 @@ heatEstimate();
 $('#showH').addEventListener('change', () => { if (heatEnt) heatEnt.show = $('#showH').checked; });
 
 /* ===== layout: tabs, summary bar, map layers, phone bottom sheet ===== */
-const APP_VERSION = '2026-11-27 22:48';
+const APP_VERSION = '2026-11-27 22:55';
 document.querySelectorAll('.appver').forEach(el => { el.textContent = '版本 ' + APP_VERSION; });
 // Update check: a home-screen web app has no address bar or reload button, and GitHub Pages lets the HTML be cached
 // for about 10 minutes, so ask the server for version.json directly and offer a reload that bypasses the cache.
