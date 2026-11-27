@@ -97,3 +97,19 @@ export function sanitizeMap(obj, validator) {
   }
   return out;
 }
+
+/* ----- Per-site storage keys (single source of truth) -----
+   Each site stores its data under `<site.store><key>`. Keep these lists in sync with
+   every SK('...') used in app.js; tests/storage-keys.test.mjs checks that they are. */
+// User edits and settings for a site ("clear this site's local settings" removes these).
+export const SITE_SETTING_KEYS = ['RUs', 'UEs', 'BS', 'BH', 'BHseedFix', 'Mat', 'Cal', 'Extra', 'Drawn', 'H3D', 'Traced'];
+// Downloaded, re-fetchable caches (kept on reset, removed when a custom project is deleted).
+export const SITE_CACHE_KEYS = ['OSM', 'NLSC3D'];
+
+// Remove a site's keys from both localStorage and IndexedDB, whichever holds them.
+export async function clearSiteKeys(store, { ueKey, includeCaches = false } = {}) {
+  if (!store) return;
+  const keys = new Set([...SITE_SETTING_KEYS, ...(includeCaches ? SITE_CACHE_KEYS : [])]);
+  if (ueKey) keys.add(ueKey);
+  for (const k of keys) await idbDel(store + k);   // idbDel also clears the localStorage copy
+}
