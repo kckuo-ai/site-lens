@@ -670,7 +670,7 @@ tr.p:hover,tr.p.on{background:rgba(255,179,71,.12)}
       <div id="roOut" style="margin-top:10px"></div>
     </section>
 
-    <p class="sub appverline" data-tab="set"><span class="appver"></span> · <button type="button" class="linkbtn" id="chkUpd">檢查更新</button> · <a href="https://github.com/kckuo-ai/alaska-rays" target="_blank" rel="noopener">GitHub</a></p>
+    <p class="sub appverline" data-tab="set"><span class="appver"></span> · <button type="button" class="linkbtn" id="chkUpd">檢查更新</button> · <a href="https://github.com/kckuo-ai/site-lens" target="_blank" rel="noopener">GitHub</a></p>
       </div>
   </aside>
 </div>
@@ -874,7 +874,8 @@ const RT = (() => {
       if (useT && (cr.length || tBlk)) terrProfile(tx, rx, (t, x, g, y) => { const z = tx[2] + (rx[2] - tx[2]) * t; const b0 = best; cand(t, x, g, z, y); if (best !== b0) best.terr = true; });
       if (best && best.v > -0.78) {
         const J = 6.9 + 20 * Math.log10(Math.sqrt((best.v - 0.1) ** 2 + 1) + best.v - 0.1);
-        paths.push({ pts: [tx, best.p, rx], type: 'diff', via: [], pen: [], dl: J, terr: !!best.terr });
+        const veg = useV ? vegDepth(tx, best.p) + vegDepth(best.p, rx) : 0;
+        paths.push({ pts: [tx, best.p, rx], type: 'diff', via: [], pen: [], veg, dl: J, terr: !!best.terr });
       }
     }
     const cand = F.filter(f => side(f, tx)), imgs = cand.map(f => mirror(tx, f));
@@ -896,7 +897,7 @@ const RT = (() => {
       p.legs = []; let d = 0;
       for (let i = 1; i < p.pts.length; i++) { const l = Math.hypot(p.pts[i][0] - p.pts[i - 1][0], p.pts[i][1] - p.pts[i - 1][1], p.pts[i][2] - p.pts[i - 1][2]); p.legs.push(l); d += l; }
       p.d = d; p.tau = d / C * 1e9;
-      let pl = 20 * Math.log10(4 * Math.PI * d / lam);
+      let pl = 20 * Math.log10(4 * Math.PI * Math.max(d, 0.1) / lam);
       for (const f of p.via) pl += f.kind === 'ground' ? o.reflG : o.reflW;
       p.penDb = 0;
       for (const c of p.pen) {
@@ -1178,15 +1179,30 @@ async function loadNLSC3D(force) {
   const pick = [], hit = n => { const s = n.boundingVolume && n.boundingVolume.sphere; if (!s) return true; const q = Cesium.Matrix4.multiplyByPoint(MgeoInv, new Cesium.Cartesian3(s[0], s[1], s[2]), new Cesium.Cartesian3()); return Math.hypot(q.x, q.y) <= R + s[3]; };
   (function walk(n) { if (!hit(n)) return; const kids = n.children || []; if (n.content && (n.geometricError <= 14 || !kids.length)) { pick.push(n.content.uri); return; } kids.forEach(walk); })(ts.root);
   if (!pick.length) throw new Error(`${NLSC_C[code][0]}的三維建物在這個位置沒有資料，請確認縣市`);
-  const all = new Map(); let done = 0;
-  const q = pick.slice(), worker = async () => { while (q.length) { const u = q.shift(); const b = await (await fetch(new URL(u, base).href)).arrayBuffer(); nlscParseGlb(b).forEach(x => { if (x._d <= R && !all.has(x.id)) all.set(x.id, x); }); status(`下載三維建物圖磚 ${++done}/${pick.length}，已取得 ${all.size} 棟…`); } };
+  const all = new Map(); let done = 0, failed = 0;
+  const q = pick.slice(), worker = async () => {
+    while (q.length) {
+      const u = q.shift(), url = new URL(u, base).href;
+      let b = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const r = await fetch(url);
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          b = await r.arrayBuffer();
+          break;
+        } catch (e) { if (attempt === 1) { console.warn('NLSC tile failed:', u, e); failed++; } }
+      }
+      if (b) nlscParseGlb(b).forEach(x => { if (x._d <= R && !all.has(x.id)) all.set(x.id, x); });
+      status(`下載三維建物圖磚 ${++done}/${pick.length}，已取得 ${all.size} 棟…`);
+    }
+  };
   await Promise.all(Array.from({ length: 6 }, worker));
   const list = [...all.values()].map(({ _d, ...b }) => b);
-  if (!list.length) throw new Error('這個範圍內沒有三維建物');
+  if (!list.length) throw new Error(failed ? `三維建物圖磚下載失敗（${failed}/${pick.length} 塊失敗）` : '這個範圍內沒有三維建物');
   const d = new Date(), p2 = n => String(n).padStart(2, '0');
   st.nlscCache = { sig, code, date: `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`, list };
   try { localStorage.setItem(SK('NLSC3D'), JSON.stringify(st.nlscCache)); } catch (e) { console.warn(e); }
-  st.osmNote = `建築為內政部國土測繪中心三維建物（${NLSC_C[code][0]}，${list.length} 棟，含官方建物高度）。`;
+  st.osmNote = `建築為內政部國土測繪中心三維建物（${NLSC_C[code][0]}，${list.length} 棟，含官方建物高度${failed ? `；另有 ${failed} 塊圖磚下載失敗` : ''}）。`;
   syncNlscRow();
   return { parsed: list };
 }
@@ -1213,20 +1229,17 @@ async function fetchOSM() {
   if (cached && cached.q === q && Date.now() - cached.t < 7 * 864e5) return cached.data;
   const eps = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
   let lastErr;
-  for (let round = 0; round < 1; round++) {
-    for (const ep of eps) {
-      const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 25000);
-      try {
-        status(`從 OpenStreetMap 抓取建築（${new URL(ep).hostname}${round ? '，重試' : ''}）…`);
-        const res = await fetch(ep, { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal: ctl.signal });
-        if (!res.ok) throw new Error(new URL(ep).hostname + ' 回應 ' + res.status);
-        const data = await res.json();
-        if (!data.elements || !data.elements.length) throw new Error(new URL(ep).hostname + ' 回傳空資料');
-        try { localStorage.setItem(SK('OSM'), JSON.stringify({ q, t: Date.now(), data })); } catch (e) {}
-        return data;
-      } catch (e) { lastErr = e; } finally { clearTimeout(timer); }
-    }
-    if (round === 0) await new Promise(r => setTimeout(r, 4000));
+  for (const ep of eps) {
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 25000);
+    try {
+      status(`從 OpenStreetMap 抓取建築（${new URL(ep).hostname}）…`);
+      const res = await fetch(ep, { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal: ctl.signal });
+      if (!res.ok) throw new Error(new URL(ep).hostname + ' 回應 ' + res.status);
+      const data = await res.json();
+      if (!data.elements || !data.elements.length) throw new Error(new URL(ep).hostname + ' 回傳空資料');
+      try { localStorage.setItem(SK('OSM'), JSON.stringify({ q, t: Date.now(), data })); } catch (e) {}
+      return data;
+    } catch (e) { lastErr = e; } finally { clearTimeout(timer); }
   }
   // fallbacks: an older cached download, then the building outlines bundled with the site
   if (cached && cached.data) { st.osmNote = 'OSM 伺服器暫時連不上，改用上次抓到的建築資料。'; return cached.data; }
@@ -1504,9 +1517,10 @@ function ruPatt(a, u, p) {
 }
 function traceMulti(i) {
   const a = antCfg(), eirp = eirpFor(i), K = cellK(), per = [...Array(K)].map(() => ({ ps: [], ru: [] }));
-  let indoor = false;
+  const rx = uePos(i), indoor = RT.buildingAt(rx[0], rx[2]) >= 0;
   ruModeled().forEach(r => {
-    const u = st.rus[r], g = geomRU(i, r); indoor = g.indoor; if (!ruActive(r)) return;
+    if (!ruActive(r)) return;
+    const u = st.rus[r], g = geomRU(i, r);
     const c = per[cellIdx(u)], tx = ruPos(r); let lin = 0;
     g.paths.forEach(p => { const gain = ruPatt(a, u, p), q = Object.assign({}, p, { gain, pl: p.pl - gain, ru: r, tx }); c.ps.push(q); lin += Math.pow(10, (eirp - q.pl) / 10); });
     if (lin > 0) c.ru.push(lin);
@@ -3596,7 +3610,7 @@ heatEstimate();
 $('#showH').addEventListener('change', () => { if (heatEnt) heatEnt.show = $('#showH').checked; });
 
 /* ===== layout: tabs, summary bar, map layers, phone bottom sheet ===== */
-const APP_VERSION = '2026-11-10 10:30';
+const APP_VERSION = '2026-11-27 22:36';
 document.querySelectorAll('.appver').forEach(el => { el.textContent = '版本 ' + APP_VERSION; });
 // Update check: a home-screen web app has no address bar or reload button, and GitHub Pages lets the HTML be cached
 // for about 10 minutes, so ask the server for version.json directly and offer a reload that bypasses the cache.
