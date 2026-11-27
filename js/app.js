@@ -2404,8 +2404,71 @@ function heatSig(order) {
   const txs = isMulti() ? ruModeled().map(ruPos) : [txPos()];
   return (isMulti() ? 'multi:' : '') + txs.map(t => t.map(v => v.toFixed(2)).join(',')).join(';') + '|' + JSON.stringify(o) + '|' + (st.list ? st.list.length + ':' + st.list.reduce((a, b) => a + b.h, 0).toFixed(1) : '');
 }
+let heatWorkers = [], heatWorkerScene = '';
+function killHeatWorkers() { heatWorkers.forEach(w => { try { w.terminate(); } catch (e) {} }); heatWorkers = []; heatWorkerScene = ''; }
+async function runHeatWorkers(gridPts, txs, multi, o, tok, onProgress) {
+  if (typeof Worker === 'undefined') return null;
+  const nW = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1, Math.ceil(gridPts.length / 40)));
+  const { r } = centerAndRadius();
+  const ter = terrOn() && demFresh() ? st.dem : null, can = canopyGrid();
+  const sceneId = (st.list ? st.list.length + ':' + st.list.reduce((a, b) => a + b.h + (b.mat || ''), '') : '') + '|' + (ter ? ter.nx : 0) + '|' + (can ? can.nx : 0);
+  try {
+    if (heatWorkers.length !== nW || heatWorkerScene !== sceneId) {
+      killHeatWorkers();
+      const blds = st.list.map(b => ({ poly: b.poly, h: b.h, mat: b.mat }));
+      const readyPs = [];
+      for (let wi = 0; wi < nW; wi++) {
+        const w = new Worker(new URL('./rt-worker.js', import.meta.url), { type: 'module' });
+        heatWorkers.push(w);
+        readyPs.push(new Promise((res, rej) => {
+          w.onmessage = ev => { if (ev.data && ev.data.type === 'ready') res(); };
+          w.onerror = err => rej(err);
+          w.postMessage({ type: 'init', sceneId, buildings: blds, groundR: r + 300, terrain: ter, canopy: can });
+        }));
+      }
+      await Promise.all(readyPs);
+      heatWorkerScene = sceneId;
+    }
+  } catch (e) {
+    console.warn('Web Worker init failed, falling back to main thread:', e);
+    killHeatWorkers();
+    return null;
+  }
+  const chunkSize = multi ? 16 : (o.maxOrder >= 2 ? 16 : 48);
+  const queue = [];
+  for (let p = 0; p < gridPts.length; p += chunkSize) queue.push(gridPts.slice(p, p + chunkSize));
+  const pts = new Array(gridPts.length);
+  let done = 0;
+  return new Promise((resolve, reject) => {
+    let active = 0, settled = false;
+    const finish = val => { if (!settled) { settled = true; resolve(val); } };
+    const dispatch = (w, wi) => {
+      if (settled) return;
+      if (heatRunTok !== tok) { killHeatWorkers(); finish(null); return; }
+      const chunk = queue.shift();
+      if (!chunk) { if (active === 0) finish(pts); return; }
+      active++;
+      w.postMessage({ type: 'chunk', jobId: tok, workerId: wi, chunk, txs, multi, opts: o });
+    };
+    heatWorkers.forEach((w, wi) => {
+      w.onmessage = ev => {
+        if (settled || !ev.data || ev.data.type !== 'chunkDone' || ev.data.jobId !== tok) return;
+        active--;
+        for (const item of ev.data.results) {
+          const { m, ...rest } = item;
+          pts[m] = rest;
+        }
+        done += ev.data.results.length;
+        onProgress(done);
+        dispatch(w, wi);
+      };
+      w.onerror = err => { if (!settled) { settled = true; killHeatWorkers(); reject(err); } };
+      dispatch(w, wi);
+    });
+  });
+}
 async function runHeat() {
-  if (heatRunTok) { heatRunTok = 0; return; }   // second press stops a running job
+  if (heatRunTok) { heatRunTok = 0; killHeatWorkers(); return; }   // second press stops a running job
   if (!st.osm || !st.viewer) { status('請先載入地圖並計算。', true); return; }
   const R = Math.max(50, Math.min(1500, +$('#hR').value || 300)), step = Math.max(3, Math.min(100, +$('#hStep').value || 10));
   const order = $('#hOrder2').checked ? 2 : 1, spec = heatSpec(R, step), n = spec.n, N = spec.N;
@@ -2414,23 +2477,42 @@ async function runHeat() {
   const tok = heatRunTok = Date.now(), o = Object.assign({}, opts(), { maxOrder: order }), tx = txPos();
   const multi = isMulti(), rus = multi ? ruModeled() : [], rtx = rus.map(ruPos);
   $('#hRun').textContent = '停止';
-  const pts = [], idx = new Int32Array(N * N).fill(-1);
-  let done = 0, last = performance.now();
+  const gridPts = [], idx = new Int32Array(N * N).fill(-1);
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const x = (i - n) * step, z = (n - j) * step;
+    if (!spec.inside(x, z) || Math.hypot(x, z) < 2 || RT.buildingAt(x, z) >= 0) continue;
+    const m = gridPts.length;
+    idx[j * N + i] = m;
+    gridPts.push({ m, i, j, x, z, y: RT.ground(x, z) + UE_H });
+  }
+  const total = gridPts.length;
+  let pts = null;
   try {
-    for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
-      const x = (i - n) * step, z = (n - j) * step;
-      if (!spec.inside(x, z) || Math.hypot(x, z) < 2 || RT.buildingAt(x, z) >= 0) continue;
-      const rx = [x, RT.ground(x, z) + UE_H, z], pack = r => ({ az: Float32Array.from(r.paths, q => q.az), el: Float32Array.from(r.paths, q => q.el), pl: Float32Array.from(r.paths, q => q.pl) });
-      idx[j * N + i] = pts.length;
-      if (multi) pts.push({ i, j, x, z, ru: rtx.map(t => pack(RT.trace(t, rx, o))) });
-      else pts.push({ i, j, x, z, ...pack(RT.trace(tx, rx, o)) });
-      done++;
-      if (performance.now() - last > 40) {
-        status(`計算熱力圖 ${Math.min(99, Math.round(done / est * 100))}%（${done} 個格點）…`);
-        $('#hRun').textContent = `停止（${Math.min(99, Math.round(done / est * 100))}%）`;
-        await new Promise(res => setTimeout(res, 0));
-        if (heatRunTok !== tok) { status('已停止計算熱力圖。'); return; }
-        last = performance.now();
+    const onProgress = done => {
+      const pct = total ? Math.min(99, Math.round(done / total * 100)) : 99;
+      status(`計算熱力圖 ${pct}%（${done}/${total} 個格點）…`);
+      $('#hRun').textContent = `停止（${pct}%）`;
+    };
+    if (total > 0) {
+      pts = await runHeatWorkers(gridPts, multi ? rtx : [tx], multi, o, tok, onProgress);
+      if (heatRunTok !== tok) { status('已停止計算熱力圖。'); return; }
+    } else {
+      pts = [];
+    }
+    // Main-thread fallback if Web Workers are unavailable
+    if (pts === null) {
+      pts = new Array(total);
+      let last = performance.now();
+      const pack = r => ({ az: Float32Array.from(r.paths, q => q.az), el: Float32Array.from(r.paths, q => q.el), pl: Float32Array.from(r.paths, q => q.pl) });
+      for (let m = 0; m < total; m++) {
+        const g = gridPts[m], rx = [g.x, g.y, g.z];
+        pts[m] = multi ? { i: g.i, j: g.j, x: g.x, z: g.z, ru: rtx.map(t => pack(RT.trace(t, rx, o))) } : { i: g.i, j: g.j, x: g.x, z: g.z, ...pack(RT.trace(tx, rx, o)) };
+        if (performance.now() - last > 40) {
+          onProgress(m + 1);
+          await new Promise(res => setTimeout(res, 0));
+          if (heatRunTok !== tok) { status('已停止計算熱力圖。'); return; }
+          last = performance.now();
+        }
       }
     }
     st.heat = { R, step, n, N, order, sig: heatSig(order), pts, idx, multi, rus, perRU: spec.multi }; st.heatFresh = true;
@@ -2664,7 +2746,7 @@ heatEstimate();
 $('#showH').addEventListener('change', () => { if (heatEnt) heatEnt.show = $('#showH').checked; });
 
 /* ===== layout: tabs, summary bar, map layers, phone bottom sheet ===== */
-const APP_VERSION = '2026-11-27 23:00';
+const APP_VERSION = '2026-11-27 23:06';
 document.querySelectorAll('.appver').forEach(el => { el.textContent = '版本 ' + APP_VERSION; });
 // Update check: a home-screen web app has no address bar or reload button, and GitHub Pages lets the HTML be cached
 // for about 10 minutes, so ask the server for version.json directly and offer a reload that bypasses the cache.

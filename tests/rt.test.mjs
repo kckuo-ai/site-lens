@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRT } from '../js/rt.js';
+import { traceHeatChunk } from '../js/rt-worker.js';
 
 const BASE_OPTS = {
   fHz: 3.625e9,
@@ -109,4 +110,16 @@ test('canopy adds Weissberger attenuation to LOS and diffraction paths', () => {
   assert.ok(losVeg.veg > 20, `expected >20 m foliage depth, got ${losVeg.veg}`);
   assert.ok(losVeg.vl > 5, `expected >5 dB Weissberger loss, got ${losVeg.vl}`);
   assert.ok(losVeg.pl > losNo.pl + 5);
+});
+
+test('traceHeatChunk packs single-site and multi-RU worker results identically to RT.trace', () => {
+  const rt = createRT();
+  rt.setBuildings([], 500);
+  const chunk = [{ m: 0, i: 1, j: 2, x: 50, y: 1.5, z: 0 }, { m: 1, i: 2, j: 2, x: 100, y: 1.5, z: 0 }];
+  const single = traceHeatChunk(rt, chunk, [[0, 10, 0]], false, BASE_OPTS);
+  assert.equal(single.length, 2);
+  assert.ok(single[0].pl instanceof Float32Array && single[0].pl.length >= 2);
+  const multi = traceHeatChunk(rt, chunk, [[0, 10, 0], [20, 12, 10]], true, BASE_OPTS);
+  assert.equal(multi[1].ru.length, 2);
+  assert.ok(multi[1].ru[0].pl instanceof Float32Array);
 });

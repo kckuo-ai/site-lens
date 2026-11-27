@@ -14,7 +14,7 @@ resampled (2x2 max) onto a 2 m east/north grid around REF, the same local frame 
 
 Runs in GitHub Actions (network access to NOAA's public S3 bucket). LIDAR_DIR=... reuses local .laz files.
 """
-import gzip, json, os, sys, time, urllib.request
+import argparse, gzip, json, os, sys, time, urllib.request
 import numpy as np
 import laspy
 import shapely
@@ -22,28 +22,60 @@ from shapely.geometry import Polygon
 from pyproj import CRS, Transformer
 from scipy import ndimage
 
-BASE = 'https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/laz/geoid12b/8406/'
-TILES = ['20150510_AK_Anchorage_2015_%s.copc.laz' % t for t in
-         ['63436785', '63446784', '63446785', '63446786', '63456784', '63456785', '63456786']]
-AOI = (666100.0, 6784800.0, 669100.0, 6787300.0)     # UTM 5N metres: drive-test extent + margin
-CELL = 1.0
-REF = (61.1729384, -149.8841974)                      # site BS (lat, lon): origin of the canopy grid
-CAN_STEP = 2.0
+DEFAULT_CFG = {
+    'prefix': 'anchorage',
+    'source': 'NOAA OCM, 2015 Lidar: Municipality of Anchorage, AK (Digital Coast ID 8406), collected May 2015',
+    'canopy_source': 'NOAA 2015 Anchorage lidar (ID 8406): first-return surface minus ground, buildings removed',
+    'base': 'https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/laz/geoid12b/8406/',
+    'tiles': ['20150510_AK_Anchorage_2015_%s.copc.laz' % t for t in
+              ['63436785', '63446784', '63446785', '63446786', '63456784', '63456785', '63456786']],
+    'aoi': [666100.0, 6784800.0, 669100.0, 6787300.0],     # UTM metres: drive-test extent + margin
+    'ref': [61.1729384, -149.8841974],                      # site BS (lat, lon): origin of the canopy grid
+    'buildings': 'buildings_osm.json',
+    'cell': 1.0,
+    'canopy_step': 2.0,
+}
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(REPO, 'lidar')
 NOISE = {7, 18}
 GROUND = 2
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description='Compute per-building roof heights and canopy grid from COPC/LAZ lidar tiles.')
+    p.add_argument('--config', help='JSON config file overriding base, tiles, aoi, ref, buildings, prefix, etc.')
+    p.add_argument('--prefix', help='Output filename prefix (default: anchorage)')
+    p.add_argument('--buildings', help='Input buildings JSON path (default: buildings_osm.json)')
+    p.add_argument('--out-dir', help='Output directory (default: lidar/)')
+    p.add_argument('--lidar-dir', help='Local cache directory for .laz files (overrides LIDAR_DIR env)')
+    p.add_argument('--ref-lat', type=float, help='Reference BS latitude')
+    p.add_argument('--ref-lon', type=float, help='Reference BS longitude')
+    return p.parse_args()
+
+
+def load_cfg(args):
+    cfg = dict(DEFAULT_CFG)
+    if args.config:
+        with open(args.config, encoding='utf-8') as f:
+            cfg.update(json.load(f))
+    if args.prefix:
+        cfg['prefix'] = args.prefix
+    if args.buildings:
+        cfg['buildings'] = args.buildings
+    if args.ref_lat is not None and args.ref_lon is not None:
+        cfg['ref'] = [args.ref_lat, args.ref_lon]
+    return cfg
+
+
 def log(*a):
     print(*a, flush=True)
 
 
-def fetch(name, d):
+def fetch(base, name, d):
     p = os.path.join(d, name)
     if os.path.exists(p) and os.path.getsize(p) > 0:
         return p
-    url = BASE + name
+    url = base + name
     for k in range(3):
         try:
             t = time.time()
@@ -70,17 +102,23 @@ def horizontal_crs(las):
 
 
 def main():
-    d = os.environ.get('LIDAR_DIR') or os.path.join(REPO, '.lidar_cache')
+    args = parse_args()
+    cfg = load_cfg(args)
+    base, tiles = cfg['base'], cfg['tiles']
+    aoi, ref = tuple(cfg['aoi']), tuple(cfg['ref'])
+    cell, can_step = float(cfg['cell']), float(cfg['canopy_step'])
+    out_dir = args.out_dir or OUT_DIR
+    d = args.lidar_dir or os.environ.get('LIDAR_DIR') or os.path.join(REPO, '.lidar_cache')
     os.makedirs(d, exist_ok=True)
-    os.makedirs(OUT_DIR, exist_ok=True)
-    x0, y0, x1, y1 = AOI
-    nx, ny = int((x1 - x0) / CELL), int((y1 - y0) / CELL)
+    os.makedirs(out_dir, exist_ok=True)
+    x0, y0, x1, y1 = aoi
+    nx, ny = int((x1 - x0) / cell), int((y1 - y0) / cell)
     dsm = np.full(nx * ny, -np.inf, dtype=np.float64)
     gsum = np.zeros(nx * ny); gcnt = np.zeros(nx * ny)
     crs = crs_txt = None
     npts = 0
-    for name in TILES:
-        las = laspy.read(fetch(name, d))
+    for name in tiles:
+        las = laspy.read(fetch(base, name, d))
         if crs is None:
             crs, crs_txt = horizontal_crs(las)
             log('CRS:', crs_txt)
@@ -88,7 +126,7 @@ def main():
         cls = np.asarray(las.classification)
         first = np.asarray(las.return_number) == 1
         m = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
-        ix = ((x[m] - x0) / CELL).astype(np.int64); iy = ((y[m] - y0) / CELL).astype(np.int64)
+        ix = ((x[m] - x0) / cell).astype(np.int64); iy = ((y[m] - y0) / cell).astype(np.int64)
         idx = iy * nx + ix
         zc, cc, fc = z[m], cls[m], first[m]
         npts += int(m.sum())
@@ -103,7 +141,8 @@ def main():
     dsm = dsm.reshape(ny, nx); gnd = gnd.reshape(ny, nx)
     log(f'cells with surface {np.isfinite(dsm).mean():.1%}, with ground {np.isfinite(gnd).mean():.1%}; {npts:,} points')
 
-    src = json.load(open(os.path.join(REPO, 'buildings_osm.json'), encoding='utf-8'))
+    bpath = cfg['buildings'] if os.path.isabs(cfg['buildings']) else os.path.join(REPO, cfg['buildings'])
+    src = json.load(open(bpath, encoding='utf-8'))
     tf = Transformer.from_crs('EPSG:4326', crs, always_xy=True)
     heights, flat, skipped = {}, [], 0
     bmask = np.zeros((ny, nx), dtype=bool)
@@ -121,11 +160,11 @@ def main():
             continue
         grow = poly.buffer(1.5)
         gx0, gy0, gx1, gy1 = grow.bounds
-        i0, i1 = max(0, int((gx0 - x0) / CELL)), min(nx - 1, int((gx1 - x0) / CELL))
-        j0, j1 = max(0, int((gy0 - y0) / CELL)), min(ny - 1, int((gy1 - y0) / CELL))
+        i0, i1 = max(0, int((gx0 - x0) / cell)), min(nx - 1, int((gx1 - x0) / cell))
+        j0, j1 = max(0, int((gy0 - y0) / cell)), min(ny - 1, int((gy1 - y0) / cell))
         if i1 >= i0 and j1 >= j0:
             II, JJ = np.meshgrid(np.arange(i0, i1 + 1), np.arange(j0, j1 + 1))
-            ins = shapely.contains_xy(grow, x0 + (II + .5) * CELL, y0 + (JJ + .5) * CELL)
+            ins = shapely.contains_xy(grow, x0 + (II + .5) * cell, y0 + (JJ + .5) * cell)
             bmask[JJ[ins], II[ins]] = True
         inner = poly.buffer(-1.0)
         if inner.is_empty or inner.area < 4:
@@ -134,12 +173,12 @@ def main():
 
         def cells(geom, grid):
             gx0, gy0, gx1, gy1 = geom.bounds
-            i0, i1 = max(0, int((gx0 - x0) / CELL)), min(nx - 1, int((gx1 - x0) / CELL))
-            j0, j1 = max(0, int((gy0 - y0) / CELL)), min(ny - 1, int((gy1 - y0) / CELL))
+            i0, i1 = max(0, int((gx0 - x0) / cell)), min(nx - 1, int((gx1 - x0) / cell))
+            j0, j1 = max(0, int((gy0 - y0) / cell)), min(ny - 1, int((gy1 - y0) / cell))
             if i1 < i0 or j1 < j0:
                 return np.array([])
             II, JJ = np.meshgrid(np.arange(i0, i1 + 1), np.arange(j0, j1 + 1))
-            cx, cy = x0 + (II + .5) * CELL, y0 + (JJ + .5) * CELL
+            cx, cy = x0 + (II + .5) * cell, y0 + (JJ + .5) * cell
             inside = shapely.contains_xy(geom, cx, cy)
             return grid[JJ[inside], II[inside]]
 
@@ -161,20 +200,23 @@ def main():
              'p10': round(float(np.percentile(hs, 10)), 1), 'p25': round(float(np.percentile(hs, 25)), 1),
              'median': round(float(np.median(hs)), 1), 'p75': round(float(np.percentile(hs, 75)), 1),
              'p90': round(float(np.percentile(hs, 90)), 1), 'max': round(float(hs.max()), 1)}
+    prefix = cfg['prefix']
     out = {
-        'source': 'NOAA OCM, 2015 Lidar: Municipality of Anchorage, AK (Digital Coast ID 8406), collected May 2015',
-        'url': BASE, 'tiles': TILES, 'crs': crs_txt, 'aoi_utm': AOI,
+        'source': cfg['source'],
+        'url': base, 'tiles': tiles, 'crs': crs_txt, 'aoi_utm': list(aoi),
         'method': 'height = p90 of 1 m first-return surface inside footprint shrunk 1 m, minus median ground (class 2) in a 1.5-10 m ring; < 2 m listed as flat',
         'stats': stats, 'heights': heights, 'flat': flat,
     }
-    with open(os.path.join(OUT_DIR, 'heights_anchorage.json'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(out_dir, f'heights_{prefix}.json'), 'w', encoding='utf-8') as f:
         json.dump(out, f, separators=(',', ':'))
     log('stats', json.dumps(stats))
-    canopy(dsm, gnd, bmask, tf, crs)
+    canopy(dsm, gnd, bmask, tf, crs, cfg, out_dir)
 
 
-def canopy(dsm, gnd, bmask, tf, crs):
-    x0, y0, x1, y1 = AOI
+def canopy(dsm, gnd, bmask, tf, crs, cfg, out_dir):
+    x0, y0, x1, y1 = tuple(cfg['aoi'])
+    cell, can_step = float(cfg['cell']), float(cfg['canopy_step'])
+    prefix = cfg['prefix']
     ny, nx = dsm.shape
     miss = ~np.isfinite(gnd)
     _, (ri, rj) = ndimage.distance_transform_edt(miss, return_indices=True)
@@ -189,31 +231,32 @@ def canopy(dsm, gnd, bmask, tf, crs):
         small = np.zeros(n + 1, dtype=bool); small[1:] = sizes < 6
         chm[small[lab]] = 0
     chm = ndimage.maximum_filter(chm, size=2)
-    # 2 m east/north grid around REF, same approximation as the page (metres per degree at REF latitude)
-    lat0, lon0 = REF
+    # 2 m east/north grid around ref, same approximation as the page (metres per degree at ref latitude)
+    lat0, lon0 = tuple(cfg['ref'])
     mlat, mlon = 111320.0, 111320.0 * np.cos(np.radians(lat0))
     back = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True)
     cl = np.array([back.transform(x, y) for x, y in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]])
     ex0, ex1 = (cl[:, 0].min() - lon0) * mlon, (cl[:, 0].max() - lon0) * mlon
     nz0, nz1 = (cl[:, 1].min() - lat0) * mlat, (cl[:, 1].max() - lat0) * mlat
-    gx0, gz0 = np.floor(ex0 / CAN_STEP) * CAN_STEP, np.floor(nz0 / CAN_STEP) * CAN_STEP
-    gnx, gnz = int((ex1 - gx0) / CAN_STEP) + 1, int((nz1 - gz0) / CAN_STEP) + 1
-    E, N = np.meshgrid(gx0 + np.arange(gnx) * CAN_STEP, gz0 + np.arange(gnz) * CAN_STEP)
+    gx0, gz0 = np.floor(ex0 / can_step) * can_step, np.floor(nz0 / can_step) * can_step
+    gnx, gnz = int((ex1 - gx0) / can_step) + 1, int((nz1 - gz0) / can_step) + 1
+    E, N = np.meshgrid(gx0 + np.arange(gnx) * can_step, gz0 + np.arange(gnz) * can_step)
     ux, uy = tf.transform(lon0 + E / mlon, lat0 + N / mlat)
-    ii, jj = ((np.asarray(ux) - x0) / CELL).astype(int), ((np.asarray(uy) - y0) / CELL).astype(int)
+    ii, jj = ((np.asarray(ux) - x0) / cell).astype(int), ((np.asarray(uy) - y0) / cell).astype(int)
     ok = (ii >= 0) & (ii < nx) & (jj >= 0) & (jj < ny)
     out = np.zeros(E.shape, dtype=np.float32)
     out[ok] = chm[jj[ok], ii[ok]]
     q = np.clip(np.round(out / 0.2), 0, 255).astype(np.uint8)  # 0.2 m units, row = north index
-    with gzip.open(os.path.join(OUT_DIR, 'canopy_anchorage.bin.gz'), 'wb', compresslevel=9) as f:
+    bin_name = f'canopy_{prefix}.bin.gz'
+    with gzip.open(os.path.join(out_dir, bin_name), 'wb', compresslevel=9) as f:
         f.write(q.tobytes())
     tree = out > 0
-    meta = {'source': 'NOAA 2015 Anchorage lidar (ID 8406): first-return surface minus ground, buildings removed',
-            'ref': {'lat': lat0, 'lon': lon0}, 'x0': float(gx0), 'z0': float(gz0), 'step': CAN_STEP, 'nx': gnx, 'nz': gnz,
-            'scale': 0.2, 'file': 'canopy_anchorage.bin.gz',
+    meta = {'source': cfg['canopy_source'],
+            'ref': {'lat': lat0, 'lon': lon0}, 'x0': float(gx0), 'z0': float(gz0), 'step': can_step, 'nx': gnx, 'nz': gnz,
+            'scale': 0.2, 'file': bin_name,
             'stats': {'tree_fraction': round(float(tree.mean()), 3), 'median_h': round(float(np.median(out[tree])), 1) if tree.any() else 0,
                       'p90_h': round(float(np.percentile(out[tree], 90)), 1) if tree.any() else 0}}
-    with open(os.path.join(OUT_DIR, 'canopy_anchorage.json'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(out_dir, f'canopy_{prefix}.json'), 'w', encoding='utf-8') as f:
         json.dump(meta, f)
     log('canopy', json.dumps(meta['stats']), f'grid {gnx}x{gnz}')
 
