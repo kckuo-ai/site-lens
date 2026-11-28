@@ -95,7 +95,7 @@ export async function loadSiteCatalog(baseUrl = '.') {
 export async function loadSiteDefinition(siteId, baseUrl = '.') {
   const customMap = await getCustomSites();
   if (customMap[siteId]) {
-    return { id: siteId, site: sanitizeStoredSite(structuredClone(customMap[siteId])), custom: true };
+    return { id: siteId, site: attachEmbeddedFiles(sanitizeStoredSite(structuredClone(customMap[siteId]))), custom: true };
   }
   const res = await fetch(`${baseUrl}/sites/${encodeURIComponent(siteId)}/site.json`);
   if (!res.ok) throw new Error(`無法載入站點設定（${siteId}：HTTP ${res.status}）`);
@@ -185,6 +185,93 @@ export function sanitizeV2(v2) {
   };
 }
 
+/* ----- Embedded site data (from 產生站點資訊 / scripts/make_site.py): buildings, lidar heights, canopy grid ----- */
+const BID_RE = /^[A-Za-z0-9_./#:-]{1,80}$/;
+const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const HSRC_OK = ['height', 'levels', 'default'];
+
+function sanitizeBuildingsDoc(doc) {
+  if (!doc || typeof doc !== 'object' || !Array.isArray(doc.buildings)) return null;
+  const seen = new Set();
+  const list = [];
+  for (const b of doc.buildings.slice(0, 20000)) {
+    if (!b || typeof b !== 'object' || typeof b.id !== 'string' || !BID_RE.test(b.id) || seen.has(b.id) || !Array.isArray(b.ll)) continue;
+    const ll = b.ll.slice(0, 2000).filter(p => Array.isArray(p) && validLon(+p[0]) && validLat(+p[1])).map(p => [+p[0], +p[1]]);
+    if (ll.length < 4) continue;
+    const h = finiteOr(b.h);
+    seen.add(b.id);
+    list.push({
+      id: b.id, name: cleanStr(b.name, 80),
+      h: h != null && h > 0.5 && h < 700 ? h : null,
+      src: HSRC_OK.includes(b.src) && (b.src === 'default' || (h != null && h > 0.5)) ? b.src : 'default',
+      tagH: cleanStr(b.tagH, 16), levels: cleanStr(b.levels, 8), btype: cleanStr(b.btype, 40), ll,
+    });
+  }
+  if (!list.length) return null;
+  return { attribution: cleanStr(doc.attribution, 160), source: cleanStr(doc.source, 40), date: cleanStr(doc.date, 25), buildings: list };
+}
+
+function sanitizeLidarDoc(L) {
+  if (!L || typeof L !== 'object' || !L.heights || typeof L.heights !== 'object' || !L.stats) return null;
+  const heights = {};
+  let n = 0;
+  for (const [id, v] of Object.entries(L.heights)) {
+    if (n >= 20000) break;
+    if (!BID_RE.test(id) || !Array.isArray(v) || !v.length) continue;
+    const a = v.slice(0, 3).map(x => finiteOr(x));
+    if (a[0] == null || a[0] <= 0 || a[0] > 700) continue;
+    heights[id] = a; n++;
+  }
+  const stats = {};
+  for (const k of ['count', 'flat', 'skipped_no_data', 'p10', 'p25', 'median', 'p75', 'p90', 'max']) stats[k] = finiteOr(L.stats[k], 0);
+  const year = finiteOr(L.year);
+  return {
+    source: cleanStr(L.source, 300), label: cleanStr(L.label, 120), project: cleanStr(L.project, 80),
+    year: Number.isInteger(year) ? year : null, method: cleanStr(L.method, 300), crs: cleanStr(L.crs, 60),
+    stats, heights, flat: Array.isArray(L.flat) ? L.flat.filter(id => typeof id === 'string' && BID_RE.test(id)).slice(0, 20000) : [],
+  };
+}
+
+function sanitizeCanopyDoc(C) {
+  if (!C || typeof C !== 'object' || typeof C.data !== 'string' || C.data.length > 24e6 || !B64_RE.test(C.data)) return null;
+  const nx = finiteOr(C.nx), nz = finiteOr(C.nz), step = finiteOr(C.step), scale = finiteOr(C.scale);
+  const x0 = finiteOr(C.x0), z0 = finiteOr(C.z0), lat = finiteOr(C.ref && C.ref.lat), lon = finiteOr(C.ref && C.ref.lon);
+  if (![nx, nz].every(v => Number.isInteger(v) && v > 0 && v <= 4000) || !(step > 0 && step <= 20) || !(scale > 0 && scale <= 1)) return null;
+  if (x0 == null || z0 == null || !validLat(lat) || !validLon(lon)) return null;
+  const st = C.stats || {};
+  return {
+    source: cleanStr(C.source, 300), ref: { lat, lon }, x0, z0, step, nx, nz, scale,
+    stats: { tree_fraction: finiteOr(st.tree_fraction, 0), median_h: finiteOr(st.median_h, 0), p90_h: finiteOr(st.p90_h, 0) },
+    data: C.data,
+  };
+}
+
+export function sanitizeEmbedded(e) {
+  if (!e || typeof e !== 'object') return null;
+  const out = {};
+  const b = sanitizeBuildingsDoc(e.buildings); if (b) out.buildings = b;
+  const l = sanitizeLidarDoc(e.lidar); if (l) out.lidar = l;
+  const c = sanitizeCanopyDoc(e.canopy); if (c) out.canopy = c;
+  return Object.keys(out).length ? out : null;
+}
+
+// Browser only: expose embedded data through the same SITE.files URLs the app already reads.
+export function attachEmbeddedFiles(site) {
+  const e = site && site.embedded;
+  if (!e || typeof Blob === 'undefined' || typeof URL === 'undefined' || !URL.createObjectURL) return site;
+  const url = (obj, type = 'application/json') => URL.createObjectURL(new Blob([obj instanceof Uint8Array ? obj : JSON.stringify(obj)], { type }));
+  site.files = { ...(site.files || {}) };
+  if (e.buildings) { site.files.osmb = url(e.buildings); site.osmbDate = e.buildings.date || ''; }
+  if (e.lidar) site.files.lidar = url(e.lidar);
+  if (e.canopy) {
+    const { data, ...meta } = e.canopy;
+    const bin = atob(data); const u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    site.files.canopy = url({ ...meta, file: '' });
+    site.files.canopyBin = url(u8, 'application/gzip');
+  }
+  return site;
+}
+
 // Re-validate a stored custom site (projects saved before these checks existed may be unsanitized).
 export function sanitizeStoredSite(s) {
   const out = { ...s };
@@ -192,6 +279,12 @@ export function sanitizeStoredSite(s) {
   if ('rus' in s) { const r = sanitizeRus(s.rus); if (r) out.rus = r; else delete out.rus; }
   if ('cover' in s) { const c = sanitizeCover(s.cover); if (c) out.cover = c; else delete out.cover; }
   if ('v2' in s) { const v = sanitizeV2(s.v2); if (v) out.v2 = v; else delete out.v2; }
+  if ('embedded' in s) { const e = sanitizeEmbedded(s.embedded); if (e) out.embedded = e; else delete out.embedded; }
+  out.files = {};   // custom projects never point at server files; embedded data is attached as blob URLs on load
+  const hasB = !!(out.embedded && out.embedded.buildings);
+  out.bsrc = (Array.isArray(s.bsrc) ? s.bsrc : ['osm']).filter(x => ['nlsc3d', 'osm', 'osmb'].includes(x) && (x !== 'osmb' || hasB));
+  if (!out.bsrc.length) out.bsrc = ['osm'];
+  if (s.generated) out.generated = { at: cleanStr(s.generated.at, 25), notes: Array.isArray(s.generated.notes) ? s.generated.notes.map(n => cleanStr(n, 300)).filter(Boolean).slice(0, 10) : [] };
   return out;
 }
 
@@ -232,6 +325,16 @@ export async function importProjectBundle(raw) {
   const rus = sanitizeRus(s.rus); if (rus) cleanSite.rus = rus;
   const cover = sanitizeCover(s.cover); if (cover) cleanSite.cover = cover;
   const v2 = sanitizeV2(s.v2); if (v2) cleanSite.v2 = v2;
+  const emb = sanitizeEmbedded(s.embedded);
+  if (emb) {
+    cleanSite.embedded = emb;
+    if (emb.buildings && !cleanSite.bsrc.includes('osmb')) cleanSite.bsrc.unshift('osmb');
+  } else {
+    cleanSite.bsrc = cleanSite.bsrc.filter(x => x !== 'osmb' && x !== 'kmz');   // no bundled files travel with a project
+  }
+  if (s.generated && typeof s.generated === 'object') {
+    cleanSite.generated = { at: cleanStr(s.generated.at, 25), notes: Array.isArray(s.generated.notes) ? s.generated.notes.map(n => cleanStr(n, 300)).filter(Boolean).slice(0, 10) : [] };
+  }
   if (!cleanSite.bsrc.length) cleanSite.bsrc = ['osm'];
 
   await saveCustomSite(id, cleanSite);
