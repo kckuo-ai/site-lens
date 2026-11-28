@@ -38,6 +38,7 @@ DEFAULT_CFG = {
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(REPO, 'lidar')
 NOISE = {7, 18}
+NOT_VEG = {6, 9, 13, 14, 15, 16, 17}   # ASPRS building, water, wire/tower classes, bridge deck
 GROUND = 2
 
 
@@ -131,7 +132,7 @@ def rasterize(chunks, aoi, cell, veg=False):
             v = np.isin(cc, [3, 4, 5])
             np.maximum.at(vdsm, idx[v], zc[v])
             if rest:
-                mr = s & (rest[0][m] > 1)
+                mr = s & (rest[0][m] > 1) & ~np.isin(cc, list(NOT_VEG))   # no bridge decks, buildings, water, wires
                 np.maximum.at(mdsm, idx[mr], zc[mr])
             ccount += np.bincount(cc.astype(np.int64), minlength=256)[:256]
         if label:

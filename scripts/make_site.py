@@ -208,6 +208,32 @@ class EPT:
         return laspy.read(io.BytesIO(data))
 
 
+def footprint_mask(buildings, heights, tf, aoi, cell, shape):
+    """Cells within 1.5 m + 4 % of the building height of any footprint (height: lidar, else source, else 10 m)."""
+    x0, y0 = aoi[0], aoi[1]
+    ny, nx = shape
+    mask = np.zeros(shape, dtype=bool)
+    for b in buildings:
+        if len(b['ll']) < 4:
+            continue
+        poly = Polygon([tf.transform(lon, lat) for lon, lat in b['ll']])
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_empty:
+            continue
+        h = (heights.get(b['id']) or [b.get('h') or 10.0])[0]
+        grow = poly.buffer(1.5 + 0.04 * max(0.0, min(h, 300.0)))
+        gx0, gy0, gx1, gy1 = grow.bounds
+        i0, i1 = max(0, int((gx0 - x0) / cell)), min(nx - 1, int((gx1 - x0) / cell))
+        j0, j1 = max(0, int((gy0 - y0) / cell)), min(ny - 1, int((gy1 - y0) / cell))
+        if i1 < i0 or j1 < j0:
+            continue
+        II, JJ = np.meshgrid(np.arange(i0, i1 + 1), np.arange(j0, j1 + 1))
+        ins = shapely.contains_xy(grow, x0 + (II + .5) * cell, y0 + (JJ + .5) * cell)
+        mask[JJ[ins], II[ins]] = True
+    return mask
+
+
 def lidar_products(lat, lon, radius, buildings, mask_buildings=None):
     stage('lidar index')
     cands = pick_ept_resources(lat, lon, radius)
@@ -244,15 +270,18 @@ def lidar_products(lat, lon, radius, buildings, mask_buildings=None):
                 continue
             stage('heights')
             heights, flat, skipped, _, stats = building_heights(buildings, dsm, gnd, to_utm, aoi, 1.0)
-            # footprints across the whole lidar square mask the canopy (not only those inside the radius)
-            *_, bmask, _ = building_heights(mask_buildings or buildings, dsm, gnd, to_utm, aoi, 1.0)
+            # footprints across the whole lidar square mask the canopy; tall buildings get a wider margin because
+            # traced footprints and lidar roofs drift apart with height (lean / parallax in the source imagery)
+            all_b = mask_buildings or buildings
+            h_all, *_ = building_heights(all_b, dsm, gnd, to_utm, aoi, 1.0)
+            bmask = footprint_mask(all_b, h_all, to_utm, aoi, 1.0, dsm.shape)
             stage('canopy')
             # vegetation surface, best available: classified vegetation > multi-return pulses > first-return surface
             nveg = int(ccount[3] + ccount[4] + ccount[5])
             if nveg > 0.01 * npts and ccount[6] > 0:
                 vmode, vsurf = 'classified', vdsm
             elif np.isfinite(mdsm).mean() > 0.002:
-                vmode, vsurf = 'multireturn', ndimage.maximum_filter(np.nan_to_num(mdsm, nan=-1e9), size=3)
+                vmode, vsurf = 'multireturn', ndimage.maximum_filter(np.nan_to_num(mdsm, nan=-1e9), size=2)
                 vsurf[vsurf < -1e8] = np.nan
             else:
                 vmode, vsurf = 'surface', dsm
