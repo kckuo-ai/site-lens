@@ -2072,7 +2072,7 @@ function syncLidarNote() {
   if (L === undefined) { $('#lidarNote').textContent = '載入地圖時一起讀取。'; return; }
   if (!L) { $('#lidarNote').textContent = '光達高度檔讀取失敗，改用 OSM 標籤與預設高度。'; return; }
   const sx = L.stats, used = st.list ? st.list.filter(b => b.src === 'lidar').length : sx.count;
-  if (L.label) { $('#lidarNote').textContent = `${L.label}${L.year ? `（${L.year} 年）` : ''}光達，${sx.count} 棟量得高度，目前採用 ${used} 棟；中位數 ${fmt(sx.median)} m（四分位 ${fmt(sx.p25)}–${fmt(sx.p75)} m）。另有 ${sx.flat} 棟只量到地面，多半是測量之後才蓋的，維持原本高度。`; return; }
+  if (L.label) { $('#lidarNote').textContent = `${L.label}${L.year ? `（${L.year}）` : ''}光達，${sx.count} 棟量得高度，目前採用 ${used} 棟；中位數 ${fmt(sx.median)} m（四分位 ${fmt(sx.p25)}–${fmt(sx.p75)} m）。另有 ${sx.flat} 棟只量到地面，多半是測量之後才蓋的，維持原本高度。`; return; }
   $('#lidarNote').textContent = `NOAA 2015 年光達（Anchorage 市政府委託），${sx.count} 棟量得高度，目前採用 ${used} 棟；中位數 ${fmt(sx.median)} m（四分位 ${fmt(sx.p25)}–${fmt(sx.p75)} m）。另有 ${sx.flat} 棟在 2015 年只量到地面，多半是之後才蓋的，維持預設高度。`;
 }
 $('#useLidar').addEventListener('change', () => {
@@ -2112,6 +2112,8 @@ function syncVeg() {
   if (st.canopy === undefined) { $('#vegNote').textContent = '樹冠高度格網會在載入地圖時讀取（光達）。'; return; }
   if (!st.canopy) { $('#vegNote').textContent = `樹冠資料讀取失敗（${st.canopyErr}），不計植被衰減。`; return; }
   const sx = st.canopy.meta.stats;
+  const lab = st.canopy && st.canopy.meta && st.canopy.meta.source && SITE.embedded ? String(st.canopy.meta.source).split(':')[0] : '';
+  if (lab) { $('#vegNote').textContent = `樹冠來自 ${lab} 光達（2 m 格網）：樹冠覆蓋 ${fmt(sx.tree_fraction * 100, 0)}% 的範圍，樹高中位數 ${fmt(sx.median_h)} m。路徑穿過樹冠層時依穿越長度加 Weissberger 衰減（約 10 m 7 dB、20 m 12 dB），樹冠頂也當成繞射邊緣比較；樹不當反射面。在 Anchorage 用路測驗證時 NLOS 偏悲觀 3–4 dB，所以預設關閉。`; return; }
   $('#vegNote').textContent = `樹冠來自 NOAA 2015 光達（2 m 格網）：樹冠覆蓋 ${fmt(sx.tree_fraction * 100, 0)}% 的範圍，樹高中位數 ${fmt(sx.median_h)} m。路徑穿過樹冠層時依穿越長度加 Weissberger 衰減（約 10 m 7 dB、20 m 12 dB），樹冠頂也當成繞射邊緣比較；樹不當反射面。用 V2 路測驗證：LOS 偏差只少約 1 dB，NLOS 卻更悲觀 3–4 dB，整體離散度變大，所以預設關閉。`;
 }
 ['#vegOn', '#leaf'].forEach(sel => $(sel).addEventListener('change', () => {
