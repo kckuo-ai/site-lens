@@ -1,5 +1,5 @@
 /* ===== Site catalog, local custom projects, and .sitelens.json project bundle import/export ===== */
-import { idbGetWithMigration, idbSet, idbDel, sanitizeMap } from './storage.js';
+import { idbGetWithMigration, idbSet, sanitizeMap, clearSiteKeys } from './storage.js';
 
 const CUSTOM_KEY = 'sitelens_custom_sites_v1';
 export const PROJECT_SCHEMA_VERSION = 1;
@@ -34,13 +34,7 @@ export async function deleteCustomSite(id) {
   if (!s) return false;
   delete all[id];
   await idbSet(CUSTOM_KEY, all);
-  if (s.store) {
-    const keys = ['RUs', 'UEs', s.ueKey || 'UEs', 'BS', 'BH', 'BHseedFix', 'Mat', 'Cal', 'Extra', 'Traced', 'Drawn', 'H3D', 'OSM', 'NLSC3D'];
-    for (const k of keys) {
-      try { localStorage.removeItem(s.store + k); } catch (e) {}
-      await idbDel(s.store + k);
-    }
-  }
+  if (s.store) await clearSiteKeys(s.store, { ueKey: s.ueKey, includeCaches: true });
   return true;
 }
 
@@ -101,7 +95,7 @@ export async function loadSiteCatalog(baseUrl = '.') {
 export async function loadSiteDefinition(siteId, baseUrl = '.') {
   const customMap = await getCustomSites();
   if (customMap[siteId]) {
-    return { id: siteId, site: structuredClone(customMap[siteId]), custom: true };
+    return { id: siteId, site: sanitizeStoredSite(structuredClone(customMap[siteId])), custom: true };
   }
   const res = await fetch(`${baseUrl}/sites/${encodeURIComponent(siteId)}/site.json`);
   if (!res.ok) throw new Error(`無法載入站點設定（${siteId}：HTTP ${res.status}）`);
@@ -125,6 +119,82 @@ export function buildProjectBundle({ siteId, site, overrides, appVersion }) {
   };
 }
 
+/* ----- Untrusted-input sanitizers for imported / locally stored projects -----
+   .sitelens.json bundles travel between people, so every field that can reach the DOM
+   is validated here (structure, types, lengths, id charset); rendering still escapes. */
+const RU_ID_RE = /^[A-Za-z0-9_.-]{1,40}$/;
+const finiteOr = (v, d = null) => (v != null && v !== '' && Number.isFinite(+v) ? +v : d);
+const cleanStr = (v, max = 120) => (typeof v === 'string' ? v.replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, max) : '');
+const validLat = v => Number.isFinite(v) && Math.abs(v) <= 90;
+const validLon = v => Number.isFinite(v) && Math.abs(v) <= 180;
+
+export function sanitizeRus(rus) {
+  if (!rus || typeof rus !== 'object' || !Array.isArray(rus.list)) return null;
+  const seen = new Set();
+  const list = [];
+  for (const u of rus.list.slice(0, 64)) {
+    if (!u || typeof u !== 'object') continue;
+    const id = typeof u.id === 'string' ? u.id.trim() : '';
+    const lat = finiteOr(u.lat), lon = finiteOr(u.lon), cell = finiteOr(u.cell);
+    if (!RU_ID_RE.test(id) || seen.has(id) || !validLat(lat) || !validLon(lon)) continue;
+    if (!Number.isInteger(cell) || cell < 0 || cell > 1007) continue;
+    seen.add(id);
+    const az = finiteOr(u.az);
+    list.push({
+      id, cell, lat, lon,
+      az: az == null ? null : ((az % 360) + 360) % 360,
+      indoor: !!u.indoor,
+      panel: !!u.panel,
+      loc: cleanStr(u.loc, 60),
+      mount: cleanStr(u.mount, 80),
+      use: cleanStr(u.use, 80),
+    });
+  }
+  if (!list.length) return null;
+  const out = { src: cleanStr(rus.src, 160) || '匯入專案', list };
+  const tilt = finiteOr(rus.tilt);
+  if (tilt != null) out.tilt = Math.max(-30, Math.min(30, tilt));
+  const azVer = finiteOr(rus.azVer);
+  if (Number.isInteger(azVer) && azVer > 0) out.azVer = azVer;
+  return out;
+}
+
+export function sanitizeCover(cover) {
+  if (!cover || typeof cover !== 'object' || !Array.isArray(cover.poly)) return null;
+  const poly = cover.poly.slice(0, 2000)
+    .filter(p => Array.isArray(p) && p.length >= 2 && validLon(+p[0]) && validLat(+p[1]))
+    .map(p => [+p[0], +p[1]]);
+  return poly.length >= 3 ? { name: cleanStr(cover.name, 80) || '涵蓋範圍', poly } : null;
+}
+
+export function sanitizeV2(v2) {
+  if (!v2 || typeof v2 !== 'object' || !Array.isArray(v2.rows)) return null;
+  const rows = [];
+  for (const r of v2.rows.slice(0, 20000)) {
+    if (!Array.isArray(r) || r.length < 3) continue;
+    const row = r.slice(0, 12).map(x => finiteOr(x));
+    if (row[0] == null || !validLat(row[1]) || !validLon(row[2])) continue;
+    rows.push(row);
+  }
+  if (!rows.length) return null;
+  const t = Array.isArray(v2.tower) ? [finiteOr(v2.tower[0]), finiteOr(v2.tower[1])] : null;
+  return {
+    tower: t && validLat(t[0]) && validLon(t[1]) ? t : null,
+    utc: cleanStr(v2.utc, 40),
+    rows,
+  };
+}
+
+// Re-validate a stored custom site (projects saved before these checks existed may be unsanitized).
+export function sanitizeStoredSite(s) {
+  const out = { ...s };
+  out.name = cleanStr(s.name, 80) || '自訂站點';
+  if ('rus' in s) { const r = sanitizeRus(s.rus); if (r) out.rus = r; else delete out.rus; }
+  if ('cover' in s) { const c = sanitizeCover(s.cover); if (c) out.cover = c; else delete out.cover; }
+  if ('v2' in s) { const v = sanitizeV2(s.v2); if (v) out.v2 = v; else delete out.v2; }
+  return out;
+}
+
 export async function importProjectBundle(raw) {
   if (!raw || typeof raw !== 'object') throw new Error('檔案內容不是有效的 JSON 物件');
   if (raw.schemaVersion !== PROJECT_SCHEMA_VERSION) {
@@ -140,7 +210,7 @@ export async function importProjectBundle(raw) {
   const id = 'imp_' + Date.now().toString(36);
   const store = id + '_';
   const cleanSite = {
-    name: String(s.name || '匯入專案').trim().slice(0, 80),
+    name: cleanStr(String(s.name || ''), 80) || '匯入專案',
     store,
     band: ['n48', 'n77', 'n78', 'n79'].includes(s.band) ? s.band : 'n48',
     tw: !!s.tw,
@@ -159,9 +229,9 @@ export async function importProjectBundle(raw) {
     defaults: sanitizeMap(s.defaults, v => typeof v === 'number' || typeof v === 'string'),
   };
   if (s.nlscCode != null && Number.isInteger(+s.nlscCode)) cleanSite.nlscCode = +s.nlscCode;
-  if (s.rus && Array.isArray(s.rus.list)) cleanSite.rus = s.rus;
-  if (s.cover && Array.isArray(s.cover.poly)) cleanSite.cover = s.cover;
-  if (s.v2 && Array.isArray(s.v2.rows)) cleanSite.v2 = s.v2;
+  const rus = sanitizeRus(s.rus); if (rus) cleanSite.rus = rus;
+  const cover = sanitizeCover(s.cover); if (cover) cleanSite.cover = cover;
+  const v2 = sanitizeV2(s.v2); if (v2) cleanSite.v2 = v2;
   if (!cleanSite.bsrc.length) cleanSite.bsrc = ['osm'];
 
   await saveCustomSite(id, cleanSite);

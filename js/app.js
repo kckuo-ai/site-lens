@@ -1,5 +1,5 @@
 import { RT } from './rt.js';
-import { idbGetWithMigration, idbSet, idbDel, sanitizeMap } from './storage.js';
+import { idbGetWithMigration, idbSet, sanitizeMap, clearSiteKeys } from './storage.js';
 import { loadSiteCatalog, loadSiteDefinition, createCustomSiteSpec, saveCustomSite, deleteCustomSite, buildProjectBundle, importProjectBundle } from './site-manager.js';
 import { NRB, BANDS, RSRP_LV, SINR_LV, rsrpLv, fmt, wrap180, sectorAz, patt, ruPatt, polyArea, autoMat as autoMatProfile } from './rf.js';
 import { escHtml, initI18n } from './i18n.js';
@@ -446,6 +446,14 @@ st.matOv = (() => { try { return JSON.parse(localStorage.getItem(SK('Mat')) || '
 const saveMat = () => { try { localStorage.setItem(SK('Mat'), JSON.stringify(st.matOv)); } catch (e) {} };
 const MATS = { wood: { t: '木造', c: '#c8a46e' }, mixed: { t: '玻璃＋混凝土', c: '#8fb3d9' }, concrete: { t: '混凝土', c: '#9aa0a6' }, irr: { t: '鍍膜玻璃帷幕', c: '#5b7bd5' } };
 const autoMat = (btype, h, area) => autoMatProfile(btype, h, area, SITE.matProfile || 'tw');
+// One signature of the building scene (footprints, heights, materials), shared by the heatmap staleness
+// check and the Web Worker scene cache, so any building edit invalidates both.
+function sceneSignature(list) {
+  let h = 0x811c9dc5;
+  const mix = str => { for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); } };
+  for (const b of list) { mix(b.h.toFixed(2) + (b.mat || '') + ':'); for (const [x, z] of b.poly) mix(x.toFixed(1) + ',' + z.toFixed(1) + ';'); mix('|'); }
+  return list.length + ':' + (h >>> 0).toString(36);
+}
 function buildModel() {
   const defH = +$('#defH').value || 9;
   const { r } = centerAndRadius();
@@ -463,7 +471,7 @@ function buildModel() {
   RT.setBuildings(list, r + 300);
   const bi = RT.buildingAt(0, 0);
   bsBuilding = bi >= 0 ? RT.building(bi).src : -1;
-  st.list = list; st.gridSig = '';
+  st.list = list; st.gridSig = ''; st.sceneSig = sceneSignature(list);
   if (bsBuilding >= 0) $('#bsH').value = list[bsBuilding].h.toFixed(1);
   st.cache = {};
   syncLidarNote(); syncMatNote(); syncTraceNote();
@@ -504,7 +512,8 @@ const secLbl = k => isMulti() ? (oneCell() ? 'D-MIMO' : 'Cell-' + RU_CELLS[k]) :
 const RU_COL = ['#ff6b6b', '#ffa94d', '#ffd43b', '#a9e34b', '#38d9a9', '#3bc9db', '#4dabf7', '#9775fa', '#f783ac', '#e8e8e8', '#c0eb75', '#ffc078'];
 st.ruSolo = null;
 const ruActive = r => st.rus[r].on && (st.ruSolo == null || st.ruSolo === r);
-const ruShort = u => u.id.replace(/^RU-/, '').replace(/-P$|-Indoor.*$/, '');
+// Escaped: RU ids can come from imported .sitelens.json files and are interpolated into innerHTML.
+const ruShort = u => escHtml(String(u.id).replace(/^RU-/, '').replace(/-P$|-Indoor.*$/, ''));
 // Rooftop RUs drawn at a roof edge can land just outside the footprint: snap to a building within 6 m.
 const ruRoofCache = new WeakMap();
 function ruRoof(r, x, z) {
@@ -1119,7 +1128,7 @@ function reportDelta() {
 }
 function renderRUSolo() {
   const sel = $('#ruSolo'), want = st.ruSolo == null ? '' : String(st.ruSolo);
-  sel.innerHTML = '<option value="">全部 RU 疊加</option>' + ruModeled().map(r => `<option value="${r}">只看 ${ruShort(st.rus[r])}（Cell-${st.rus[r].cell}，${st.rus[r].az}°）</option>`).join('');
+  sel.innerHTML = '<option value="">全部 RU 疊加</option>' + ruModeled().map(r => `<option value="${r}">只看 ${ruShort(st.rus[r])}（Cell-${escHtml(st.rus[r].cell)}，${escHtml(st.rus[r].az)}°）</option>`).join('');
   sel.value = want;
 }
 function syncCombNote() {
@@ -1136,11 +1145,11 @@ function renderRUTable() {
   const box = $('#ruTbl'), ae = document.activeElement; if (box.contains(ae) && ae.tagName === 'INPUT' && ae.type === 'number') return;   // don't rebuild under the user's cursor
   $('#ruSrc').textContent = 'RU 布點：' + SITE.rus.src + '。';
   box.innerHTML = '<tr><th>啟用</th><th>RU</th><th>Cell</th><th>方位角 (°)</th><th>電子下傾 (°)</th><th>天線離地</th><th>位置</th></tr>' + st.rus.map((u, r) => {
-    if (u.indoor) return `<tr><td>—</td><td>${ruShort(u)}<small>${u.loc || '室內'}</small></td><td>Cell-${u.cell}</td><td colspan="4" style="font-family:inherit"><small>室內 RU，暫不計算</small></td></tr>`;
+    if (u.indoor) return `<tr><td>—</td><td>${ruShort(u)}<small>${escHtml(u.loc || '室內')}</small></td><td>Cell-${escHtml(u.cell)}</td><td colspan="4" style="font-family:inherit"><small>室內 RU，暫不計算</small></td></tr>`;
     const moved = Math.abs(u.lat - RU_LIST[r].lat) > 1e-7 || Math.abs(u.lon - RU_LIST[r].lon) > 1e-7;
     const k = RU_CELLS.indexOf(u.cell), h = st.osm && st.viewer && MgeoInv ? fmt(ruPos(r)[1] - RT.ground(ruPos(r)[0], ruPos(r)[2]), 1) + ' m' : '—';
-    return `<tr><td><input type="checkbox" data-r="${r}" data-f="on"${u.on ? ' checked' : ''}></td><td>${ruShort(u)}<small>${u.loc || ''}</small></td>` +
-      `<td><span class="sec" style="background:${SEC_COL[k].toCssHexString()}"></span>Cell-${u.cell}</td>` +
+    return `<tr><td><input type="checkbox" data-r="${r}" data-f="on"${u.on ? ' checked' : ''}></td><td>${ruShort(u)}<small>${escHtml(u.loc || '')}</small></td>` +
+      `<td><span class="sec" style="background:${SEC_COL[k].toCssHexString()}"></span>Cell-${escHtml(u.cell)}</td>` +
       `<td><input type="number" data-r="${r}" data-f="az" step="5" value="${u.az}" style="width:64px"></td><td><input type="number" data-r="${r}" data-f="tilt" step="1" value="${u.tilt}" style="width:56px"></td><td>${h}</td>` +
       `<td><button type="button" class="ruMove" data-move="${r}" aria-pressed="${st.picking === 'ru:' + r}">${st.picking === 'ru:' + r ? '點地圖…' : '移動'}</button>${moved ? '<small>已移動</small>' : ''}</td></tr>`;
   }).join('');
@@ -1330,7 +1339,7 @@ async function runRUOpt() {
     `<div><dt>計算</dt><dd>${rounds > 4 ? 4 : rounds}<small>輪 · ${((performance.now() - t0) / 1000).toFixed(1)} 秒</small></dd></div></dl>` +
     `<table class="mini" style="margin-top:8px"><tr><th>RU</th><th>方位角</th><th>電子下傾</th></tr>` +
     changed.map(n => { const r = H.rus[n], b = before[n], q = cfg[n], same = b.az === q.az && b.tilt === q.tilt;
-      return `<tr><td>${ruShort(st.rus[r])}<small>Cell-${st.rus[r].cell}</small></td><td>${b.az}° → <b>${q.az}°</b></td><td>${b.tilt}° → <b>${q.tilt}°</b>${same ? '<small>不變</small>' : ''}</td></tr>`; }).join('') + '</table>' +
+      return `<tr><td>${ruShort(st.rus[r])}<small>Cell-${escHtml(st.rus[r].cell)}</small></td><td>${b.az}° → <b>${q.az}°</b></td><td>${b.tilt}° → <b>${q.tilt}°</b>${same ? '<small>不變</small>' : ''}</td></tr>`; }).join('') + '</table>' +
     `<p class="sub" style="margin-top:6px">按「套用到 RU」會把建議值寫進「天線」分頁的 RU 表格（覆蓋你目前的方位角與下傾），熱力圖會立即更新。方位角每 10°、下傾每 1° 搜尋；結果是在目前建築高度、RU 位置與合併方式下的最佳值。</p>`;
   $('#roApply').hidden = !changed.some(n => before[n].az !== cfg[n].az || before[n].tilt !== cfg[n].tilt);
   status(`多 RU 最佳化完成：同時達標 ${pct(s0.ok)} → ${pct(cur.ok)}。`);
@@ -1739,9 +1748,8 @@ let siteResetArm = 0;
 $('#siteReset').addEventListener('click', async () => {
   if (Date.now() - siteResetArm > 5000) { siteResetArm = Date.now(); $('#siteReset').textContent = '再按一次確認清除'; setTimeout(() => { if (Date.now() - siteResetArm >= 5000) $('#siteReset').textContent = '清除本機設定，回到預設'; }, 5100); return; }
   try {
-    ['RUs', 'UEs', SITE.ueKey || 'UEs', 'BS', 'BH', 'BHseedFix', 'Mat', 'Cal', 'Extra', 'Traced', 'Drawn', 'H3D'].forEach(k => localStorage.removeItem(SK(k)));
+    await clearSiteKeys(SITE.store, { ueKey: SITE.ueKey });
     ['devLoss', 'planScen'].forEach(k => localStorage.removeItem(k));
-    await idbDel(SK('Traced'));
   } catch (e) {}
   hardReload();
 });
@@ -2402,7 +2410,7 @@ st.heat = null;
 function heatSig(order) {
   const o = Object.assign({}, opts(), { maxOrder: order });
   const txs = isMulti() ? ruModeled().map(ruPos) : [txPos()];
-  return (isMulti() ? 'multi:' : '') + txs.map(t => t.map(v => v.toFixed(2)).join(',')).join(';') + '|' + JSON.stringify(o) + '|' + (st.list ? st.list.length + ':' + st.list.reduce((a, b) => a + b.h, 0).toFixed(1) : '');
+  return (isMulti() ? 'multi:' : '') + txs.map(t => t.map(v => v.toFixed(2)).join(',')).join(';') + '|' + JSON.stringify(o) + '|' + (st.sceneSig || '');
 }
 let heatWorkers = [], heatWorkerScene = '';
 function killHeatWorkers() { heatWorkers.forEach(w => { try { w.terminate(); } catch (e) {} }); heatWorkers = []; heatWorkerScene = ''; }
@@ -2411,7 +2419,7 @@ async function runHeatWorkers(gridPts, txs, multi, o, tok, onProgress) {
   const nW = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1, Math.ceil(gridPts.length / 40)));
   const { r } = centerAndRadius();
   const ter = terrOn() && demFresh() ? st.dem : null, can = canopyGrid();
-  const sceneId = (st.list ? st.list.length + ':' + st.list.reduce((a, b) => a + b.h + (b.mat || ''), '') : '') + '|' + (ter ? ter.nx : 0) + '|' + (can ? can.nx : 0);
+  const sceneId = (st.sceneSig || '') + '|' + (ter ? ter.nx : 0) + '|' + (can ? can.nx : 0) + '|' + Math.round(r + 300);
   try {
     if (heatWorkers.length !== nW || heatWorkerScene !== sceneId) {
       killHeatWorkers();
