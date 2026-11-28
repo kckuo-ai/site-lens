@@ -105,6 +105,7 @@
       <label class="f">評估站點<select id="siteSel"></select></label>
       <div class="tools" style="margin-top:6px">
         <button type="button" id="projNew">＋ 新增專案</button>
+        <button type="button" id="projGen">產生站點資訊</button>
         <button type="button" id="projExp">匯出專案</button>
         <button type="button" id="projImpBtn">匯入專案</button>
         <input type="file" id="projImp" accept=".json,.sitelens.json" hidden>
@@ -126,6 +127,32 @@
           <button type="button" class="primary" id="npCreate">建立並切換</button>
           <button type="button" id="npCancel">取消</button>
         </div>
+      </div>
+      <div id="genForm" hidden style="margin-top:8px;padding:8px;border:1px solid var(--bd);border-radius:8px;background:rgba(255,255,255,.02)">
+        <p class="sub" style="margin:0 0 6px">輸入美國任一地點，自動取得建築輪廓（Overture Maps）、USGS 3DEP 光達量測的建築高度與樹冠，完成後自動建立本機專案。運算在 GitHub Actions 執行，約 2–10 分鐘；結果加密傳回，只有這個瀏覽器能解開。</p>
+        <label class="f">專案名稱<input type="text" id="sgName" placeholder="例如：Seattle 測試場域"></label>
+        <div class="row2" style="margin-top:6px">
+          <label class="f">中心緯度<input type="number" id="sgLat" step="0.000001" inputmode="decimal" placeholder="47.606209"></label>
+          <label class="f">中心經度<input type="number" id="sgLon" step="0.000001" inputmode="decimal" placeholder="-122.332071"></label>
+        </div>
+        <div class="row2" style="margin-top:6px">
+          <label class="f">評估半徑 (m)<input type="number" id="sgRad" value="500" min="100" max="1500" step="50"></label>
+          <label class="f">頻段<select id="sgBand"><option value="n48">n48 CBRS（3625 MHz）</option><option value="n77">n77（3750 MHz）</option><option value="n78">n78（3500 MHz）</option><option value="n79">n79（4850 MHz）</option></select></label>
+        </div>
+        <details id="sgTokWrap" style="margin-top:8px">
+          <summary>GitHub token <span id="sgTokState" class="sub"></span></summary>
+          <p class="sub" style="margin:6px 0">第一次使用需要一個只限這個 repo 的 fine-grained token：GitHub → Settings → Developer settings → Fine-grained tokens → Generate new token；Repository access 選 <b>Only select repositories → site-lens</b>；Permissions 的 <b>Actions</b> 與 <b>Contents</b> 都設 <b>Read and write</b>。token 只存在這個瀏覽器。</p>
+          <label class="f">Token<input type="password" id="sgTok" autocomplete="off" placeholder="github_pat_…"></label>
+          <div class="tools" style="margin-top:6px">
+            <button type="button" id="sgTokSave">儲存並檢查</button>
+            <button type="button" id="sgTokClear">清除 token</button>
+          </div>
+        </details>
+        <div class="tools" style="margin-top:8px">
+          <button type="button" class="primary" id="sgStart">開始產生</button>
+          <button type="button" id="sgCancel">關閉</button>
+        </div>
+        <div id="sgJobs" style="margin-top:8px"></div>
       </div>
       <div class="row2" style="margin-top:8px">
         <label class="f">基站緯度<input type="number" id="bsLat" step="0.000001" inputmode="decimal"></label>

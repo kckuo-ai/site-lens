@@ -1,0 +1,7 @@
+laspy[lazrs]==2.7.0
+numpy
+shapely>=2
+pyproj
+scipy
+overturemaps
+cryptography

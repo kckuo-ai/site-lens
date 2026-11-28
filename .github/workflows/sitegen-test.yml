@@ -1,0 +1,99 @@
+name: sitegen test (temporary)
+on:
+  push:
+    branches: [claude/sitegen]
+permissions:
+  contents: write
+jobs:
+  refactor-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -q "laspy[lazrs]==2.7.0" numpy shapely pyproj scipy
+      - name: Re-run Anchorage lidar with refactored script, compare with committed output
+        run: |
+          python scripts/lidar_heights.py --out-dir /tmp/chk > /tmp/chk.log 2>&1 || { tail -30 /tmp/chk.log; exit 1; }
+          tail -4 /tmp/chk.log
+          python - <<'PY'
+          import json, gzip
+          a = json.load(open('lidar/heights_anchorage.json')); b = json.load(open('/tmp/chk/heights_anchorage.json'))
+          print('heights identical:', a['heights'] == b['heights'], 'stats identical:', a['stats'] == b['stats'], 'flat identical:', a['flat'] == b['flat'])
+          ca = json.load(open('lidar/canopy_anchorage.json')); cb = json.load(open('/tmp/chk/canopy_anchorage.json'))
+          print('canopy meta identical:', ca == cb)
+          print('canopy grid identical:', gzip.open('lidar/canopy_anchorage.bin.gz').read() == gzip.open('/tmp/chk/canopy_anchorage.bin.gz').read())
+          PY
+  gen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { tag: seattle, lat: '47.6062', lon: '-122.3321', radius: '400', req: 'rtest0seattle1' }
+          - { tag: anchorage, lat: '61.1729384', lon: '-149.8841974', radius: '500', req: 'rtest0anchor01' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: scripts/requirements-sitegen.txt
+      - run: pip install -q -r scripts/requirements-sitegen.txt
+      - name: Fake dispatch event
+        run: |
+          jq -n --arg lat "${{ matrix.lat }}" --arg lon "${{ matrix.lon }}" --arg r "${{ matrix.radius }}" --arg req "${{ matrix.req }}" \
+            --arg pk "$(cat scripts/_test_pub.b64)" '{inputs: {req: $req, lat: $lat, lon: $lon, radius: $r, pubkey: $pk}}' > "$RUNNER_TEMP/event.json"
+      - name: Generate
+        run: |
+          /usr/bin/time -v python scripts/make_site.py --from-event "$RUNNER_TEMP/event.json" --out "$RUNNER_TEMP/result.json" --plain "$RUNNER_TEMP/plain.json" 2> "$RUNNER_TEMP/time.txt"
+          grep -E 'Elapsed|Maximum resident' "$RUNNER_TEMP/time.txt"
+          ls -la "$RUNNER_TEMP"/*.json
+          python - <<'PY'
+          import json, os
+          p = json.load(open(os.environ['RUNNER_TEMP'] + '/plain.json'))
+          print('notes', p.get('notes'), 'error', p.get('error'), 'seconds', p.get('seconds'))
+          if p.get('trace'): print(p['trace'])
+          b = (p.get('buildings') or {}).get('buildings') or []
+          print('buildings', len(b), 'with h', sum(1 for x in b if x['h']))
+          L = p.get('lidar')
+          if L: print('lidar', L['project'], L['year'], L['cover'], L['points'], L['stats'])
+          C = p.get('canopy')
+          if C: print('canopy', C['nx'], C['nz'], C['stats'], len(C['data']))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sitegen-${{ matrix.tag }}
+          path: |
+            ${{ runner.temp }}/plain.json
+            ${{ runner.temp }}/result.json
+          retention-days: 3
+      - name: Publish encrypted result to sitegen-out-test
+        env:
+          OUT_BRANCH: sitegen-out-test
+        run: |
+          set -euo pipefail
+          REQ=$(jq -r .inputs.req "$RUNNER_TEMP/event.json")
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          for i in 1 2 3 4 5 6; do
+            TREE_DIR="$RUNNER_TEMP/out-tree"; rm -rf "$TREE_DIR"; mkdir -p "$TREE_DIR"
+            BASE=""
+            if git fetch -q --depth=1 origin "$OUT_BRANCH" 2>/dev/null; then
+              BASE=$(git rev-parse FETCH_HEAD)
+              git archive "$BASE" | tar -x -C "$TREE_DIR"
+            fi
+            python scripts/sitegen_publish.py "$TREE_DIR" "$RUNNER_TEMP/result.json" "$REQ"
+            export GIT_INDEX_FILE="$RUNNER_TEMP/out-index"; rm -f "$GIT_INDEX_FILE"
+            git --work-tree="$TREE_DIR" add -A
+            TREE=$(git write-tree); unset GIT_INDEX_FILE
+            COMMIT=$(git commit-tree "$TREE" -m "sitegen result $REQ")
+            # single-commit branch; the lease makes concurrent runs retry instead of overwriting each other
+            if git push -q --force-with-lease="refs/heads/$OUT_BRANCH:$BASE" origin "$COMMIT:refs/heads/$OUT_BRANCH"; then
+              echo "published"; exit 0
+            fi
+            echo "branch moved, retry $i"; sleep $((RANDOM % 8 + 2))
+          done
+          exit 1

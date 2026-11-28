@@ -101,30 +101,16 @@ def horizontal_crs(las):
     return c, c.to_string()
 
 
-def main():
-    args = parse_args()
-    cfg = load_cfg(args)
-    base, tiles = cfg['base'], cfg['tiles']
-    aoi, ref = tuple(cfg['aoi']), tuple(cfg['ref'])
-    cell, can_step = float(cfg['cell']), float(cfg['canopy_step'])
-    out_dir = args.out_dir or OUT_DIR
-    d = args.lidar_dir or os.environ.get('LIDAR_DIR') or os.path.join(REPO, '.lidar_cache')
-    os.makedirs(d, exist_ok=True)
-    os.makedirs(out_dir, exist_ok=True)
+def rasterize(chunks, aoi, cell):
+    """Accumulate lidar points onto a 1 m grid in the projected CRS of `aoi`.
+    chunks yields (x, y, z, classification, is_first_return, label) numpy arrays.
+    Returns (dsm, gnd, npts): max first-return surface and mean ground (class 2) per cell."""
     x0, y0, x1, y1 = aoi
     nx, ny = int((x1 - x0) / cell), int((y1 - y0) / cell)
     dsm = np.full(nx * ny, -np.inf, dtype=np.float64)
     gsum = np.zeros(nx * ny); gcnt = np.zeros(nx * ny)
-    crs = crs_txt = None
     npts = 0
-    for name in tiles:
-        las = laspy.read(fetch(base, name, d))
-        if crs is None:
-            crs, crs_txt = horizontal_crs(las)
-            log('CRS:', crs_txt)
-        x, y, z = np.asarray(las.x), np.asarray(las.y), np.asarray(las.z)
-        cls = np.asarray(las.classification)
-        first = np.asarray(las.return_number) == 1
+    for x, y, z, cls, first, label in chunks:
         m = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
         ix = ((x[m] - x0) / cell).astype(np.int64); iy = ((y[m] - y0) / cell).astype(np.int64)
         idx = iy * nx + ix
@@ -135,18 +121,22 @@ def main():
         g = cc == GROUND
         gsum += np.bincount(idx[g], weights=zc[g], minlength=nx * ny)
         gcnt += np.bincount(idx[g], minlength=nx * ny)
-        log(f'{name}: {m.sum():,} points in area, {g.sum():,} ground')
+        if label:
+            log(f'{label}: {m.sum():,} points in area, {g.sum():,} ground')
     dsm[~np.isfinite(dsm)] = np.nan
     gnd = np.where(gcnt > 0, gsum / np.maximum(gcnt, 1), np.nan)
     dsm = dsm.reshape(ny, nx); gnd = gnd.reshape(ny, nx)
     log(f'cells with surface {np.isfinite(dsm).mean():.1%}, with ground {np.isfinite(gnd).mean():.1%}; {npts:,} points')
+    return dsm, gnd, npts
 
-    bpath = cfg['buildings'] if os.path.isabs(cfg['buildings']) else os.path.join(REPO, cfg['buildings'])
-    src = json.load(open(bpath, encoding='utf-8'))
-    tf = Transformer.from_crs('EPSG:4326', crs, always_xy=True)
+
+def building_heights(buildings, dsm, gnd, tf, aoi, cell):
+    """Per-footprint roof height (see module docstring). Returns (heights, flat, skipped, bmask, stats)."""
+    x0, y0, x1, y1 = aoi
+    ny, nx = dsm.shape
     heights, flat, skipped = {}, [], 0
     bmask = np.zeros((ny, nx), dtype=bool)
-    for b in src['buildings']:
+    for b in buildings:
         xy = [tf.transform(lon, lat) for lon, lat in b['ll']]
         if len(xy) < 4:
             continue
@@ -200,11 +190,45 @@ def main():
              'p10': round(float(np.percentile(hs, 10)), 1), 'p25': round(float(np.percentile(hs, 25)), 1),
              'median': round(float(np.median(hs)), 1), 'p75': round(float(np.percentile(hs, 75)), 1),
              'p90': round(float(np.percentile(hs, 90)), 1), 'max': round(float(hs.max()), 1)}
+    return heights, flat, skipped, bmask, stats
+
+
+METHOD = 'height = p90 of 1 m first-return surface inside footprint shrunk 1 m, minus median ground (class 2) in a 1.5-10 m ring; < 2 m listed as flat'
+
+
+def main():
+    args = parse_args()
+    cfg = load_cfg(args)
+    base, tiles = cfg['base'], cfg['tiles']
+    aoi = tuple(cfg['aoi'])
+    cell = float(cfg['cell'])
+    out_dir = args.out_dir or OUT_DIR
+    d = args.lidar_dir or os.environ.get('LIDAR_DIR') or os.path.join(REPO, '.lidar_cache')
+    os.makedirs(d, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+    crs_box = {}
+
+    def chunks():
+        for name in tiles:
+            las = laspy.read(fetch(base, name, d))
+            if 'crs' not in crs_box:
+                crs_box['crs'], crs_box['txt'] = horizontal_crs(las)
+                log('CRS:', crs_box['txt'])
+            yield (np.asarray(las.x), np.asarray(las.y), np.asarray(las.z), np.asarray(las.classification),
+                   np.asarray(las.return_number) == 1, name)
+
+    dsm, gnd, _ = rasterize(chunks(), aoi, cell)
+    crs, crs_txt = crs_box['crs'], crs_box['txt']
+
+    bpath = cfg['buildings'] if os.path.isabs(cfg['buildings']) else os.path.join(REPO, cfg['buildings'])
+    src = json.load(open(bpath, encoding='utf-8'))
+    tf = Transformer.from_crs('EPSG:4326', crs, always_xy=True)
+    heights, flat, skipped, bmask, stats = building_heights(src['buildings'], dsm, gnd, tf, aoi, cell)
     prefix = cfg['prefix']
     out = {
         'source': cfg['source'],
         'url': base, 'tiles': tiles, 'crs': crs_txt, 'aoi_utm': list(aoi),
-        'method': 'height = p90 of 1 m first-return surface inside footprint shrunk 1 m, minus median ground (class 2) in a 1.5-10 m ring; < 2 m listed as flat',
+        'method': METHOD,
         'stats': stats, 'heights': heights, 'flat': flat,
     }
     with open(os.path.join(out_dir, f'heights_{prefix}.json'), 'w', encoding='utf-8') as f:
@@ -213,10 +237,10 @@ def main():
     canopy(dsm, gnd, bmask, tf, crs, cfg, out_dir)
 
 
-def canopy(dsm, gnd, bmask, tf, crs, cfg, out_dir):
-    x0, y0, x1, y1 = tuple(cfg['aoi'])
-    cell, can_step = float(cfg['cell']), float(cfg['canopy_step'])
-    prefix = cfg['prefix']
+def canopy_grid(dsm, gnd, bmask, tf, crs, aoi, cell, can_step, ref):
+    """Canopy height grid on a can_step east/north grid around ref.
+    Returns (q, meta): q = uint8 array (0.2 m units, row = north index), meta = grid geometry + stats."""
+    x0, y0, x1, y1 = aoi
     ny, nx = dsm.shape
     miss = ~np.isfinite(gnd)
     _, (ri, rj) = ndimage.distance_transform_edt(miss, return_indices=True)
@@ -232,7 +256,7 @@ def canopy(dsm, gnd, bmask, tf, crs, cfg, out_dir):
         chm[small[lab]] = 0
     chm = ndimage.maximum_filter(chm, size=2)
     # 2 m east/north grid around ref, same approximation as the page (metres per degree at ref latitude)
-    lat0, lon0 = tuple(cfg['ref'])
+    lat0, lon0 = tuple(ref)
     mlat, mlon = 111320.0, 111320.0 * np.cos(np.radians(lat0))
     back = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True)
     cl = np.array([back.transform(x, y) for x, y in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]])
@@ -247,18 +271,25 @@ def canopy(dsm, gnd, bmask, tf, crs, cfg, out_dir):
     out = np.zeros(E.shape, dtype=np.float32)
     out[ok] = chm[jj[ok], ii[ok]]
     q = np.clip(np.round(out / 0.2), 0, 255).astype(np.uint8)  # 0.2 m units, row = north index
+    tree = out > 0
+    meta = {'ref': {'lat': lat0, 'lon': lon0}, 'x0': float(gx0), 'z0': float(gz0), 'step': can_step, 'nx': gnx, 'nz': gnz,
+            'scale': 0.2,
+            'stats': {'tree_fraction': round(float(tree.mean()), 3), 'median_h': round(float(np.median(out[tree])), 1) if tree.any() else 0,
+                      'p90_h': round(float(np.percentile(out[tree], 90)), 1) if tree.any() else 0}}
+    log('canopy', json.dumps(meta['stats']), f'grid {gnx}x{gnz}')
+    return q, meta
+
+
+def canopy(dsm, gnd, bmask, tf, crs, cfg, out_dir):
+    prefix = cfg['prefix']
+    q, g = canopy_grid(dsm, gnd, bmask, tf, crs, tuple(cfg['aoi']), float(cfg['cell']), float(cfg['canopy_step']), tuple(cfg['ref']))
     bin_name = f'canopy_{prefix}.bin.gz'
     with gzip.open(os.path.join(out_dir, bin_name), 'wb', compresslevel=9) as f:
         f.write(q.tobytes())
-    tree = out > 0
-    meta = {'source': cfg['canopy_source'],
-            'ref': {'lat': lat0, 'lon': lon0}, 'x0': float(gx0), 'z0': float(gz0), 'step': can_step, 'nx': gnx, 'nz': gnz,
-            'scale': 0.2, 'file': bin_name,
-            'stats': {'tree_fraction': round(float(tree.mean()), 3), 'median_h': round(float(np.median(out[tree])), 1) if tree.any() else 0,
-                      'p90_h': round(float(np.percentile(out[tree], 90)), 1) if tree.any() else 0}}
+    meta = {'source': cfg['canopy_source'], 'ref': g['ref'], 'x0': g['x0'], 'z0': g['z0'], 'step': g['step'],
+            'nx': g['nx'], 'nz': g['nz'], 'scale': g['scale'], 'file': bin_name, 'stats': g['stats']}
     with open(os.path.join(out_dir, f'canopy_{prefix}.json'), 'w', encoding='utf-8') as f:
         json.dump(meta, f)
-    log('canopy', json.dumps(meta['stats']), f'grid {gnx}x{gnz}')
 
 
 if __name__ == '__main__':

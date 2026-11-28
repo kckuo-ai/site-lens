@@ -1,5 +1,6 @@
 import { RT } from './rt.js';
 import { idbGetWithMigration, idbSet, sanitizeMap, clearSiteKeys } from './storage.js';
+import { initSitegen } from './sitegen-ui.js';
 import { loadSiteCatalog, loadSiteDefinition, createCustomSiteSpec, saveCustomSite, deleteCustomSite, buildProjectBundle, importProjectBundle } from './site-manager.js';
 import { NRB, BANDS, RSRP_LV, SINR_LV, rsrpLv, fmt, wrap180, sectorAz, patt, ruPatt, polyArea, autoMat as autoMatProfile } from './rf.js';
 import { escHtml, initI18n } from './i18n.js';
@@ -96,7 +97,7 @@ async function loadBundledOSM() {
   // Bundled files no longer carry height overrides: user edits live only in this browser, so "Reset" sticks.
   // One-time cleanup of the Crowne Plaza 21 m override that an earlier bundled file seeded into localStorage.
   try { if (!localStorage.getItem(SK('BHseedFix'))) { if (st.hOv['way/791456329'] === 21) { delete st.hOv['way/791456329']; saveOv(); } localStorage.setItem(SK('BHseedFix'), '1'); } } catch (e) {}
-  st.osmNote = `建築為網站內附的 OSM 資料（${SITE.osmbDate || ''} 匯出）。`;
+  st.osmNote = SITE.embedded && SITE.embedded.buildings ? `建築為產生站點資訊時取得的 Overture 資料（${j.buildings.length} 棟，${SITE.osmbDate || ''}）。` : `建築為網站內附的 OSM 資料（${SITE.osmbDate || ''} 匯出）。`;
   return { parsed: j.buildings };
 }
 async function loadBundled(note) {
@@ -2059,7 +2060,8 @@ $('#calHint').addEventListener('click', e => { const b = e.target.closest('[data
 /* ===== lidar building heights (per OSM footprint, computed offline from public lidar) ===== */
 async function ensureLidar() {
   if (!SITE.files.lidar || st.lidar !== undefined) return;
-  try { const r = await fetch(SITE.files.lidar + '?v=' + encodeURIComponent(APP_VERSION)); st.lidar = r.ok ? await r.json() : null; } catch (e) { st.lidar = null; }
+  try { const r = await fetch(bust(SITE.files.lidar)); st.lidar = r.ok ? await r.json() : null; } catch (e) { st.lidar = null; }
+  if (st.lidar && st.lidar.label) HSRC.lidar.t = '光達量測（' + st.lidar.label + '）';
   syncLidarNote();
 }
 function syncLidarNote() {
@@ -2070,6 +2072,7 @@ function syncLidarNote() {
   if (L === undefined) { $('#lidarNote').textContent = '載入地圖時一起讀取。'; return; }
   if (!L) { $('#lidarNote').textContent = '光達高度檔讀取失敗，改用 OSM 標籤與預設高度。'; return; }
   const sx = L.stats, used = st.list ? st.list.filter(b => b.src === 'lidar').length : sx.count;
+  if (L.label) { $('#lidarNote').textContent = `${L.label}${L.year ? `（${L.year} 年）` : ''}光達，${sx.count} 棟量得高度，目前採用 ${used} 棟；中位數 ${fmt(sx.median)} m（四分位 ${fmt(sx.p25)}–${fmt(sx.p75)} m）。另有 ${sx.flat} 棟只量到地面，多半是測量之後才蓋的，維持原本高度。`; return; }
   $('#lidarNote').textContent = `NOAA 2015 年光達（Anchorage 市政府委託），${sx.count} 棟量得高度，目前採用 ${used} 棟；中位數 ${fmt(sx.median)} m（四分位 ${fmt(sx.p25)}–${fmt(sx.p75)} m）。另有 ${sx.flat} 棟在 2015 年只量到地面，多半是之後才蓋的，維持預設高度。`;
 }
 $('#useLidar').addEventListener('change', () => {
@@ -2084,9 +2087,9 @@ $('#useLidar').addEventListener('change', () => {
 async function ensureCanopy() {
   if (!SITE.files.canopy || st.canopy !== undefined) return;
   try {
-    const meta = await (await fetch(SITE.files.canopy + '?v=' + encodeURIComponent(APP_VERSION))).json();
-    const base = SITE.files.canopy.replace(/[^/]*$/, '');
-    const buf = await (await fetch(base + meta.file + '?v=' + encodeURIComponent(APP_VERSION))).arrayBuffer();
+    const meta = await (await fetch(bust(SITE.files.canopy))).json();
+    const binUrl = SITE.files.canopyBin || SITE.files.canopy.replace(/[^/]*$/, '') + meta.file;   // canopyBin: embedded (generated) site
+    const buf = await (await fetch(bust(binUrl))).arrayBuffer();
     if (typeof DecompressionStream === 'undefined') throw new Error('這個瀏覽器不支援解壓縮');
     const raw = new Uint8Array(await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
     if (raw.length !== meta.nx * meta.nz) throw new Error('樹冠格網大小不符');
@@ -2197,6 +2200,7 @@ async function moveBS(lat, lon) {
   $('#siteSel').addEventListener('change', () => { try { localStorage.setItem('lastSite', $('#siteSel').value); } catch (e) {} location.search = '?site=' + encodeURIComponent($('#siteSel').value); });
   $('#projNew').onclick = () => {
     const f = $('#projForm'); f.hidden = !f.hidden;
+    if (!f.hidden) $('#genForm').hidden = true;
     if (!f.hidden && !$('#npLat').value) { $('#npLat').value = SITE.bs.lat.toFixed(6); $('#npLon').value = SITE.bs.lon.toFixed(6); }
   };
   $('#npCancel').onclick = () => { $('#projForm').hidden = true; };
@@ -2219,6 +2223,7 @@ async function moveBS(lat, lon) {
     download(`${SITE_ID}.sitelens.json`, bundle);
     toast('已匯出專案檔（.sitelens.json）。');
   };
+  initSitegen({ status, toast, here: { lat: SITE.bs.lat, lon: SITE.bs.lon } });
   $('#projImpBtn').onclick = () => $('#projImp').click();
   $('#projImp').onchange = async e => {
     const f = e.target.files[0]; if (!f) return;
@@ -2247,6 +2252,7 @@ async function moveBS(lat, lon) {
   if (!st.rus.length) { const o = $('#antMode').querySelector('option[value="multi"]'); if (o) o.remove(); }
   if (d.antModel || d.antMode) applyAntModel(true);
   [...$('#bsrc').options].forEach(o => { if (!SITE.bsrc.includes(o.value)) o.remove(); });
+  if (SITE.embedded && SITE.embedded.buildings) { const o = $('#bsrc').querySelector('option[value="osmb"]'); if (o) o.textContent = `產生的建築資料（Overture，${SITE.embedded.buildings.buildings.length} 棟，${SITE.embedded.buildings.date}，建議）`; }
   if (SITE.bsrc.length === 1 && SITE.bsrc[0] === 'osm') $('#bsrc').options[0].textContent = '即時查詢 OpenStreetMap（之後可下載內附）';
   syncNlscRow();
   if (!SITE.tw) document.querySelectorAll('#mode option[data-tw]').forEach(o => o.remove());
@@ -2754,7 +2760,9 @@ heatEstimate();
 $('#showH').addEventListener('change', () => { if (heatEnt) heatEnt.show = $('#showH').checked; });
 
 /* ===== layout: tabs, summary bar, map layers, phone bottom sheet ===== */
-const APP_VERSION = '2026-11-27 23:06';
+const APP_VERSION = '2026-11-28 10:30';
+// cache-busting query for server files; blob: URLs (embedded / generated sites) must not get one
+function bust(u) { return String(u).startsWith('blob:') ? u : u + '?v=' + encodeURIComponent(APP_VERSION); }
 document.querySelectorAll('.appver').forEach(el => { el.textContent = '版本 ' + APP_VERSION; });
 // Update check: a home-screen web app has no address bar or reload button, and GitHub Pages lets the HTML be cached
 // for about 10 minutes, so ask the server for version.json directly and offer a reload that bypasses the cache.
