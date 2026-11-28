@@ -93,7 +93,8 @@ def overture_buildings(lat, lon, radius):
             if len(ring) < 4:
                 continue
             local = Polygon([((x - lon) * mlon, (y - lat) * mlat) for x, y in ring])
-            if local.distance(center) > radius + 20:
+            dist = local.distance(center)
+            if dist > r * 1.5:      # outside the lidar square (corners are r*sqrt(2) away)
                 continue
             h = row.get('height') if 'height' in cols else None
             fl = row.get('num_floors') if 'num_floors' in cols else None
@@ -110,9 +111,14 @@ def overture_buildings(lat, lon, radius):
                 'levels': str(fl) if fl else '',
                 'btype': str(row.get('class') or row.get('subtype') or '')[:40],
                 'll': [[round(x, 7), round(y, 7)] for x, y in ring],
+                '_in': dist <= radius + 20,
             })
     out.sort(key=lambda b: Polygon(b['ll']).centroid.distance(Point(lon, lat)))
-    return out[:MAX_BUILDINGS]
+    out = out[:MAX_BUILDINGS]
+    # every footprint masks the canopy grid; only those within the radius go into the site
+    site = [{k: v for k, v in b.items() if k != '_in'} for b in out if b['_in']]
+    mask = [{k: v for k, v in b.items() if k != '_in'} for b in out]
+    return site, mask
 
 
 # ---------------------------------------------------------------- lidar (3DEP EPT)
@@ -201,7 +207,7 @@ class EPT:
         return laspy.read(io.BytesIO(data))
 
 
-def lidar_products(lat, lon, radius, buildings):
+def lidar_products(lat, lon, radius, buildings, mask_buildings=None):
     stage('lidar index')
     cands = pick_ept_resources(lat, lon, radius)
     if not cands:
@@ -231,14 +237,19 @@ def lidar_products(lat, lon, radius, buildings):
                         if i % 50 == 0:
                             log(f'  nodes read {i + 1}/{len(keys)}')
 
-            dsm, gnd, npts = rasterize(chunks(), aoi, 1.0)
+            dsm, gnd, npts, vdsm, ccount = rasterize(chunks(), aoi, 1.0, veg=True)
             if npts < 1000 or not np.isfinite(gnd).any():
                 last_err = 'lidar survey has no ground-classified points here'
                 continue
             stage('heights')
-            heights, flat, skipped, bmask, stats = building_heights(buildings, dsm, gnd, to_utm, aoi, 1.0)
+            heights, flat, skipped, _, stats = building_heights(buildings, dsm, gnd, to_utm, aoi, 1.0)
+            # footprints across the whole lidar square mask the canopy (not only those inside the radius)
+            *_, bmask, _ = building_heights(mask_buildings or buildings, dsm, gnd, to_utm, aoi, 1.0)
             stage('canopy')
-            q, cmeta = canopy_grid(dsm, gnd, bmask, to_utm, utm, aoi, 1.0, 2.0, (lat, lon))
+            nveg = int(ccount[3] + ccount[4] + ccount[5])
+            classified = nveg > 0.01 * npts and ccount[6] > 0
+            q, cmeta = canopy_grid(vdsm if classified else dsm, gnd, bmask, to_utm, utm, aoi, 1.0, 2.0, (lat, lon))
+            log(f"canopy from {'vegetation-classified points' if classified else 'first-return surface'}")
             label = f"USGS 3DEP {c['name']}"
             lidar = {
                 'source': f"USGS 3D Elevation Program lidar, project {c['name']} (EPT: {ept.base})",
@@ -247,7 +258,9 @@ def lidar_products(lat, lon, radius, buildings):
                 'method': METHOD, 'stats': stats, 'heights': heights, 'flat': flat,
             }
             canopy = dict(cmeta)
-            canopy['source'] = f"{label}: first-return surface minus ground, buildings removed"
+            canopy['source'] = (f"{label}: vegetation-classified points (ASPRS 3-5) minus ground, buildings removed" if classified
+                                else f"{label}: first-return surface minus ground, buildings removed")
+            lidar['classes'] = {str(k): int(v) for k, v in enumerate(ccount) if v}
             canopy['data'] = base64.b64encode(gzip.compress(q.tobytes(), 9)).decode()
             return lidar, canopy, None
         except Exception as e:  # noqa: BLE001
@@ -277,7 +290,7 @@ def build_payload(lat, lon, radius):
                'center': {'lat': lat, 'lon': lon}, 'radius': radius, 'buildings': None, 'lidar': None, 'canopy': None, 'notes': notes}
     stage('buildings')
     try:
-        bl = overture_buildings(lat, lon, radius)
+        bl, mask_bl = overture_buildings(lat, lon, radius)
         payload['buildings'] = {'attribution': '© Overture Maps Foundation (ODbL, includes © OpenStreetMap contributors)',
                                 'source': 'overture', 'date': payload['created'][:10], 'buildings': bl}
         log(f'{len(bl)} buildings')
@@ -286,9 +299,9 @@ def build_payload(lat, lon, radius):
     except Exception as e:  # noqa: BLE001
         notes.append(f'buildings failed: {type(e).__name__}: {e}')
         log('buildings failed; the page will fall back to live OpenStreetMap')
-        bl = []
+        bl, mask_bl = [], []
     try:
-        lidar, canopy, err = lidar_products(lat, lon, radius, bl)
+        lidar, canopy, err = lidar_products(lat, lon, radius, bl, mask_bl)
         payload['lidar'], payload['canopy'] = lidar, canopy
         if err:
             notes.append('lidar: ' + err)

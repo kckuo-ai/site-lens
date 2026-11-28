@@ -28,7 +28,7 @@ def main(tree, result, req):
     now = time.time() * 1000
     for f in os.listdir(out):
         a = age_hours(f, now)
-        if a is None or a > MAX_AGE_H:
+        if a is None or a > MAX_AGE_H or a < -1:   # unparseable, stale, or from the future
             os.remove(os.path.join(out, f))
     shutil.copyfile(result, os.path.join(out, req + '.json'))
     with open(os.path.join(tree, 'README.md'), 'w') as f:

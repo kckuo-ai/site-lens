@@ -101,14 +101,18 @@ def horizontal_crs(las):
     return c, c.to_string()
 
 
-def rasterize(chunks, aoi, cell):
+def rasterize(chunks, aoi, cell, veg=False):
     """Accumulate lidar points onto a 1 m grid in the projected CRS of `aoi`.
     chunks yields (x, y, z, classification, is_first_return, label) numpy arrays.
-    Returns (dsm, gnd, npts): max first-return surface and mean ground (class 2) per cell."""
+    Returns (dsm, gnd, npts): max first-return surface and mean ground (class 2) per cell.
+    veg=True also returns (vdsm, class_counts): max height of vegetation-classified points (3/4/5, any return)
+    and the number of points per ASPRS class, so callers can prefer classified vegetation when a survey has it."""
     x0, y0, x1, y1 = aoi
     nx, ny = int((x1 - x0) / cell), int((y1 - y0) / cell)
     dsm = np.full(nx * ny, -np.inf, dtype=np.float64)
     gsum = np.zeros(nx * ny); gcnt = np.zeros(nx * ny)
+    vdsm = np.full(nx * ny, -np.inf, dtype=np.float64) if veg else None
+    ccount = np.zeros(256, dtype=np.int64)
     npts = 0
     for x, y, z, cls, first, label in chunks:
         m = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
@@ -121,12 +125,19 @@ def rasterize(chunks, aoi, cell):
         g = cc == GROUND
         gsum += np.bincount(idx[g], weights=zc[g], minlength=nx * ny)
         gcnt += np.bincount(idx[g], minlength=nx * ny)
+        if veg:
+            v = np.isin(cc, [3, 4, 5])
+            np.maximum.at(vdsm, idx[v], zc[v])
+            ccount += np.bincount(cc.astype(np.int64), minlength=256)[:256]
         if label:
             log(f'{label}: {m.sum():,} points in area, {g.sum():,} ground')
     dsm[~np.isfinite(dsm)] = np.nan
     gnd = np.where(gcnt > 0, gsum / np.maximum(gcnt, 1), np.nan)
     dsm = dsm.reshape(ny, nx); gnd = gnd.reshape(ny, nx)
     log(f'cells with surface {np.isfinite(dsm).mean():.1%}, with ground {np.isfinite(gnd).mean():.1%}; {npts:,} points')
+    if veg:
+        vdsm[~np.isfinite(vdsm)] = np.nan
+        return dsm, gnd, npts, vdsm.reshape(ny, nx), ccount
     return dsm, gnd, npts
 
 
