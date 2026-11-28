@@ -62,6 +62,15 @@ jobs:
           if L: print('lidar', L['project'], L['year'], L['cover'], L['points'], L['stats'])
           C = p.get('canopy')
           if C: print('canopy', C['nx'], C['nz'], C['stats'], len(C['data']))
+          if L: print('classes', L.get('classes'))
+          if C:
+              import base64, gzip, numpy as np
+              q = np.frombuffer(gzip.decompress(base64.b64decode(C['data'])), np.uint8).reshape(C['nz'], C['nx']) * 0.2
+              Z, X = np.meshgrid(C['z0'] + np.arange(C['nz']) * C['step'], C['x0'] + np.arange(C['nx']) * C['step'], indexing='ij'); R = np.hypot(X, Z); r = p['radius']
+              print('canopy method', C.get('method'))
+              for lo, hi in [(0, r / 2), (r / 2, r), (r, 1e9)]:
+                  m = (R >= lo) & (R < hi); t = q[m] > 0
+                  print(f'  ring {lo:.0f}-{hi:.0f} m: tree fraction {t.mean():.3f}, p90 {np.percentile(q[m][t], 90) if t.any() else 0:.1f} m')
           PY
       - uses: actions/upload-artifact@v4
         with:

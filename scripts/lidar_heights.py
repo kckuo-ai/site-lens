@@ -103,18 +103,20 @@ def horizontal_crs(las):
 
 def rasterize(chunks, aoi, cell, veg=False):
     """Accumulate lidar points onto a 1 m grid in the projected CRS of `aoi`.
-    chunks yields (x, y, z, classification, is_first_return, label) numpy arrays.
+    chunks yields (x, y, z, classification, is_first_return, label[, number_of_returns]) numpy arrays.
     Returns (dsm, gnd, npts): max first-return surface and mean ground (class 2) per cell.
-    veg=True also returns (vdsm, class_counts): max height of vegetation-classified points (3/4/5, any return)
-    and the number of points per ASPRS class, so callers can prefer classified vegetation when a survey has it."""
+    veg=True also returns (vdsm, mdsm, class_counts): max height of vegetation-classified points (3/4/5, any return),
+    max height of first returns from multi-return pulses (canopy lets part of the pulse through, roofs do not),
+    and the number of points per ASPRS class, so callers can pick the best vegetation surface a survey supports."""
     x0, y0, x1, y1 = aoi
     nx, ny = int((x1 - x0) / cell), int((y1 - y0) / cell)
     dsm = np.full(nx * ny, -np.inf, dtype=np.float64)
     gsum = np.zeros(nx * ny); gcnt = np.zeros(nx * ny)
     vdsm = np.full(nx * ny, -np.inf, dtype=np.float64) if veg else None
+    mdsm = np.full(nx * ny, -np.inf, dtype=np.float64) if veg else None
     ccount = np.zeros(256, dtype=np.int64)
     npts = 0
-    for x, y, z, cls, first, label in chunks:
+    for x, y, z, cls, first, label, *rest in chunks:
         m = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
         ix = ((x[m] - x0) / cell).astype(np.int64); iy = ((y[m] - y0) / cell).astype(np.int64)
         idx = iy * nx + ix
@@ -128,6 +130,9 @@ def rasterize(chunks, aoi, cell, veg=False):
         if veg:
             v = np.isin(cc, [3, 4, 5])
             np.maximum.at(vdsm, idx[v], zc[v])
+            if rest:
+                mr = s & (rest[0][m] > 1)
+                np.maximum.at(mdsm, idx[mr], zc[mr])
             ccount += np.bincount(cc.astype(np.int64), minlength=256)[:256]
         if label:
             log(f'{label}: {m.sum():,} points in area, {g.sum():,} ground')
@@ -136,8 +141,8 @@ def rasterize(chunks, aoi, cell, veg=False):
     dsm = dsm.reshape(ny, nx); gnd = gnd.reshape(ny, nx)
     log(f'cells with surface {np.isfinite(dsm).mean():.1%}, with ground {np.isfinite(gnd).mean():.1%}; {npts:,} points')
     if veg:
-        vdsm[~np.isfinite(vdsm)] = np.nan
-        return dsm, gnd, npts, vdsm.reshape(ny, nx), ccount
+        vdsm[~np.isfinite(vdsm)] = np.nan; mdsm[~np.isfinite(mdsm)] = np.nan
+        return dsm, gnd, npts, vdsm.reshape(ny, nx), mdsm.reshape(ny, nx), ccount
     return dsm, gnd, npts
 
 

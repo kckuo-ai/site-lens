@@ -25,6 +25,7 @@ import laspy
 import shapely
 from shapely.geometry import Polygon, Point
 from pyproj import CRS, Transformer
+from scipy import ndimage
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lidar_heights import rasterize, building_heights, canopy_grid, METHOD  # noqa: E402
@@ -233,11 +234,11 @@ def lidar_products(lat, lon, radius, buildings, mask_buildings=None):
                     for i, las in enumerate(pool.map(ept.read, [k for k, _ in keys])):
                         x, y = back.transform(np.asarray(las.x), np.asarray(las.y))
                         yield (np.asarray(x), np.asarray(y), np.asarray(las.z), np.asarray(las.classification),
-                               np.asarray(las.return_number) == 1, None)
+                               np.asarray(las.return_number) == 1, None, np.asarray(las.number_of_returns))
                         if i % 50 == 0:
                             log(f'  nodes read {i + 1}/{len(keys)}')
 
-            dsm, gnd, npts, vdsm, ccount = rasterize(chunks(), aoi, 1.0, veg=True)
+            dsm, gnd, npts, vdsm, mdsm, ccount = rasterize(chunks(), aoi, 1.0, veg=True)
             if npts < 1000 or not np.isfinite(gnd).any():
                 last_err = 'lidar survey has no ground-classified points here'
                 continue
@@ -246,10 +247,17 @@ def lidar_products(lat, lon, radius, buildings, mask_buildings=None):
             # footprints across the whole lidar square mask the canopy (not only those inside the radius)
             *_, bmask, _ = building_heights(mask_buildings or buildings, dsm, gnd, to_utm, aoi, 1.0)
             stage('canopy')
+            # vegetation surface, best available: classified vegetation > multi-return pulses > first-return surface
             nveg = int(ccount[3] + ccount[4] + ccount[5])
-            classified = nveg > 0.01 * npts and ccount[6] > 0
-            q, cmeta = canopy_grid(vdsm if classified else dsm, gnd, bmask, to_utm, utm, aoi, 1.0, 2.0, (lat, lon))
-            log(f"canopy from {'vegetation-classified points' if classified else 'first-return surface'}")
+            if nveg > 0.01 * npts and ccount[6] > 0:
+                vmode, vsurf = 'classified', vdsm
+            elif np.isfinite(mdsm).mean() > 0.002:
+                vmode, vsurf = 'multireturn', ndimage.maximum_filter(np.nan_to_num(mdsm, nan=-1e9), size=3)
+                vsurf[vsurf < -1e8] = np.nan
+            else:
+                vmode, vsurf = 'surface', dsm
+            q, cmeta = canopy_grid(vsurf, gnd, bmask, to_utm, utm, aoi, 1.0, 2.0, (lat, lon))
+            log(f'canopy from {vmode}')
             label = f"USGS 3DEP {c['name']}"
             lidar = {
                 'source': f"USGS 3D Elevation Program lidar, project {c['name']} (EPT: {ept.base})",
@@ -258,8 +266,10 @@ def lidar_products(lat, lon, radius, buildings, mask_buildings=None):
                 'method': METHOD, 'stats': stats, 'heights': heights, 'flat': flat,
             }
             canopy = dict(cmeta)
-            canopy['source'] = (f"{label}: vegetation-classified points (ASPRS 3-5) minus ground, buildings removed" if classified
-                                else f"{label}: first-return surface minus ground, buildings removed")
+            canopy['source'] = f"{label}: " + {'classified': 'vegetation-classified points (ASPRS 3-5)',
+                                                 'multireturn': 'first returns of multi-return pulses',
+                                                 'surface': 'first-return surface'}[vmode] + ' minus ground, buildings removed'
+            canopy['method'] = vmode
             lidar['classes'] = {str(k): int(v) for k, v in enumerate(ccount) if v}
             canopy['data'] = base64.b64encode(gzip.compress(q.tobytes(), 9)).decode()
             return lidar, canopy, None
